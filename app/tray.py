@@ -5,6 +5,11 @@
 
 状态用图标颜色区分：蓝=待命，红=录音中。鼠标悬停提示里带实时计时，
 不打开窗口也能知道录了多久。
+
+关于右键菜单只走一条路径：Windows 上 QSystemTrayIcon 一旦 setContextMenu，
+Qt 自己就在原生右键里弹菜单，而 activated 里的 Context 通知在部分环境下
+也会来 —— 两条都接必然弹两次。这里固定用「原生 contextMenu」这一条，
+_on_activated 只处理单击，不再手动 popup。
 """
 from __future__ import annotations
 
@@ -93,15 +98,29 @@ class Tray(QObject):
 
         self.menu = menu
         self.tray.setContextMenu(menu)
-        # 单击直接打开界面；右键由 contextMenu 处理
+        # 单击直接打开界面；右键由原生 contextMenu 处理（不要在这里再 popup，
+        # 否则会和 setContextMenu 各弹一次）
         self.tray.activated.connect(self._on_activated)
 
     def _on_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.show_requested.emit()
 
-    def show(self):
+    def show(self) -> bool:
+        """显示托盘图标，返回「Qt 侧是否认为图标已显示」。
+
+        注意这个返回值的局限：isVisible() 只反映 Qt 有没有成功 show，
+        **探测不到 Win11 把图标收进「^」溢出区**（那种情况下它照样返回 True）。
+        溢出区问题由 trayfix 写 IsPromoted 解决；这里的 False 只对应
+        「系统托盘根本不可用」（被策略禁用、explorer 卡死）—— 而进程此时已被
+        setQuitOnLastWindowClosed(False) 吊着，用户会得到一个既没图标也没窗口的
+        隐形进程，只能去任务管理器杀。所以调用方拿到 False 就该把窗口亮出来。
+        """
         self.tray.show()
+        visible = bool(self.tray.isVisible())
+        if not visible:
+            log.warning("托盘图标 show() 后仍不可见（系统托盘不可用或被策略禁用）")
+        return visible
 
     def hide(self):
         self.tray.hide()
@@ -113,7 +132,13 @@ class Tray(QObject):
         self.act_autostart.blockSignals(False)
 
     def notify(self, title: str, body: str, ms: int = 4000):
-        if QSystemTrayIcon.supportsMessages():
+        # supportsMessages() 在部分环境下会抛（后端未初始化），别让通知把主流程带崩
+        try:
+            ok = QSystemTrayIcon.supportsMessages()
+        except Exception:
+            log.debug("supportsMessages 调用异常，跳过气泡通知", exc_info=True)
+            return
+        if ok:
             self.tray.showMessage(title, body, self._icon_idle, ms)
 
     def set_state(self, state: str, elapsed: float = 0.0, busy: bool = False):

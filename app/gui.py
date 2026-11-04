@@ -25,8 +25,9 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 # 目录约定：
@@ -45,6 +46,8 @@ else:
 sys.path.insert(0, str(APP_DIR))
 
 import autostart  # noqa: E402
+import feishu_setup  # noqa: E402
+import trayfix  # noqa: E402
 from service import RecService  # noqa: E402
 from singleton import InstanceLock, notify_existing  # noqa: E402
 from tray import Tray, app_icon  # noqa: E402
@@ -158,6 +161,9 @@ class RecWindow(QMainWindow):
         self._start_hidden = start_hidden
         self._httpd = None
         self._feishu_bot = None
+        # 托盘 show() 是否成功。注意它探测不到 Win11 溢出区（那种情况也是 True），
+        # 只对应「托盘根本不可用」；False 时窗口必须强制亮出。
+        self._tray_visible = True
 
         self.setWindowTitle("录音助手")
         self.setWindowIcon(app_icon())
@@ -176,7 +182,11 @@ class RecWindow(QMainWindow):
         self.tray.toggle_record.connect(self._tray_toggle)
         self.tray.autostart_toggled.connect(self._on_autostart_toggled)
         self.tray.open_folder_requested.connect(self._open_folder)
-        self.tray.show()
+        # 图标没显示出来时不能让应用变成「隐形进程」：进程被 setQuitOnLastWindowClosed(False)
+        # 吊着，用户既没有图标也没有窗口，只能去任务管理器杀。
+        self._tray_visible = self.tray.show()
+        if not self._tray_visible:
+            log.warning("托盘图标不可见，改为直接显示窗口以免应用无入口")
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -184,6 +194,38 @@ class RecWindow(QMainWindow):
 
         self._boot_service()
         self._first_run_autostart()
+        self._promote_tray_icon()
+
+    # ---------- 托盘可见性 ----------
+    def _promote_tray_icon(self):
+        """把托盘图标从 Win11 的「^」溢出区提到可见托盘区。
+
+        为什么需要：Win11 默认把新出现的托盘图标收进溢出区，用户右下角
+        看不到图标，就会以为程序没启动 —— 这正是用户实际反馈的问题。
+
+        为什么要重试：explorer 是在图标**真正显示之后**才写注册表记录的，
+        启动那一刻往往还查不到，所以用定时器反复试几次，拿到确定结果就停。
+        """
+        self._promoter = trayfix.TrayPromoter(attempts=5)
+        self._promote_timer = QTimer(self)
+        self._promote_timer.timeout.connect(self._promote_step)
+        self._promote_timer.start(1000)      # 1 秒一次，最多 5 次
+
+    def _promote_step(self):
+        st = self._promoter.step()
+        if not self._promoter.done:
+            return
+        self._promote_timer.stop()
+        if st in (trayfix.PROMOTED, trayfix.ALREADY):
+            log.info("托盘图标已提升到可见区域（状态=%s）", st)
+        elif st == trayfix.NOT_FOUND:
+            # 用完重试次数仍没找到记录：图标可能压根没显示（托盘被禁用等）
+            log.warning("托盘图标提升失败：注册表里始终没有本进程的记录")
+            self._emit_log("托盘图标可能被收进了 ^ 溢出区，可手动拖到任务栏")
+        elif st == trayfix.UNSUPPORTED:
+            log.info("托盘图标提升：当前系统不需要/不支持")
+        elif st == trayfix.ERROR:
+            log.warning("托盘图标提升失败：注册表写入被拒绝")
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -283,7 +325,20 @@ class RecWindow(QMainWindow):
         self.ed_app_id = QLineEdit()
         self.ed_app_id.setPlaceholderText("cli_xxxxxxxx")
         self.ed_app_id.setMinimumHeight(30)
-        grid.addWidget(self.ed_app_id, 1, 1, 1, 2)
+        grid.addWidget(self.ed_app_id, 1, 1)
+
+        # 一键创建：飞书不开放建应用接口，所以这里做「引导 + 自动校验 + 自动回填」。
+        # 放在 App ID 行右侧，紧挨着用户要填的地方，减少来回找。
+        self.btn_feishu_setup = QPushButton("一键创建飞书机器人")
+        self.btn_feishu_setup.setObjectName("secondary")
+        self.btn_feishu_setup.setMinimumHeight(30)
+        # 限宽：否则它会挤掉 App ID 输入框，和下面 App Secret 的右边缘对不齐
+        self.btn_feishu_setup.setMaximumWidth(150)
+        self.btn_feishu_setup.setCursor(Qt.PointingHandCursor)
+        self.btn_feishu_setup.setToolTip(
+            "打开飞书开发者后台创建应用，并自动校验你填的 App ID / App Secret")
+        self.btn_feishu_setup.clicked.connect(self.on_feishu_setup)
+        grid.addWidget(self.btn_feishu_setup, 1, 2)
 
         grid.addWidget(QLabel("App Secret"), 2, 0)
         self.ed_secret = QLineEdit()
@@ -435,6 +490,37 @@ class RecWindow(QMainWindow):
         if d:
             self.ed_dir.setText(d)
             self.log_signal.emit("目录已修改，点「保存并生效」后应用")
+
+    # ---------- 飞书一键创建 ----------
+    def on_feishu_setup(self):
+        """打开引导向导：浏览器建应用 → 粘贴凭据 → 真校验 → 自动启用。
+
+        飞书不开放「创建应用」的接口，所以这里不做假的一键建成，而是把
+        用户必须在网页上点的几下之外的全部环节（开页面、填名、列权限、
+        校验、回填、启用）都自动化掉。
+        """
+        dlg = FeishuSetupDialog(self)
+        dlg.exec()
+        res = dlg.result_payload
+        if not res:
+            return
+        # 校验通过才走到这里：回填输入框、写配置、重启服务
+        self.ed_app_id.setText(res.get("app_id", ""))
+        self.ed_secret.setText(res.get("app_secret", ""))
+        feishu_setup.apply_to_config(self.cfg, res["app_id"], res["app_secret"])
+        try:
+            save_config(self.cfg)
+        except Exception:
+            log.exception("保存飞书配置失败")
+            QMessageBox.warning(self, "保存失败", "配置写入失败，请检查目录权限。")
+            return
+        self._refresh_feishu_label()
+        self.log_signal.emit("飞书凭据校验通过，已启用长连接")
+        if self._recording:
+            # 录音中不重启服务（会删掉正在写的分片），提示用户稍后生效
+            self.log_signal.emit("正在录音，飞书连接将在停止录音后生效")
+            return
+        self._restart_service()
 
     def on_save(self):
         # 录音中改配置会重启服务，而重启路径会 cancel() 删掉正在写的分片。
@@ -775,6 +861,160 @@ class RecWindow(QMainWindow):
                 pass
 
 
+class FeishuSetupDialog(QDialog):
+    """飞书机器人创建向导。
+
+    为什么不是「点一下就建好」：飞书开放平台没有创建应用的 API。
+    这里把能自动化的部分全部自动化（打开页面、复制应用名、列权限、校验、
+    回填），只在必须由用户在网页上操作的两步让用户动手，并明确说清楚。
+    """
+
+    verified = Signal(object)   # 跨线程回主线程
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("创建飞书机器人")
+        self.setMinimumWidth(560)
+        self.result_payload: dict | None = None
+        self._pending: tuple[str, str] | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(12)
+
+        head = QLabel("创建飞书机器人")
+        f = QFont(); f.setPointSize(15); f.setBold(True)
+        head.setFont(f)
+        lay.addWidget(head)
+
+        body = QLabel(feishu_setup.guide_text(feishu_setup.DEFAULT_APP_NAME))
+        body.setWordWrap(True)
+        body.setStyleSheet(f"color:{C_SUB};font-size:12px;line-height:1.6;")
+        lay.addWidget(body)
+
+        # 两个动作按钮：打开创建页 / 打开权限页（后者要等有 app_id 才有意义）
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+        self.btn_open_create = QPushButton("① 打开创建应用页")
+        self.btn_open_create.setObjectName("secondary")
+        self.btn_open_create.setMinimumHeight(32)
+        self.btn_open_create.setCursor(Qt.PointingHandCursor)
+        self.btn_open_create.clicked.connect(self._open_create)
+        act_row.addWidget(self.btn_open_create)
+
+        self.btn_copy_name = QPushButton("② 复制应用名")
+        self.btn_copy_name.setObjectName("secondary")
+        self.btn_copy_name.setMinimumHeight(32)
+        self.btn_copy_name.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_name.clicked.connect(self._copy_name)
+        act_row.addWidget(self.btn_copy_name)
+        act_row.addStretch()
+        lay.addLayout(act_row)
+
+        # 凭据输入
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(9)
+        form.addWidget(QLabel("App ID"), 0, 0)
+        self.ed_id = QLineEdit()
+        self.ed_id.setPlaceholderText("cli_xxxxxxxxxxxx")
+        self.ed_id.setMinimumHeight(30)
+        form.addWidget(self.ed_id, 0, 1)
+        form.addWidget(QLabel("App Secret"), 1, 0)
+        self.ed_secret = QLineEdit()
+        self.ed_secret.setEchoMode(QLineEdit.Password)
+        self.ed_secret.setPlaceholderText("在「凭证与基础信息」里复制")
+        self.ed_secret.setMinimumHeight(30)
+        form.addWidget(self.ed_secret, 1, 1)
+        form.setColumnStretch(1, 1)
+        lay.addLayout(form)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet(f"color:{C_SUB};font-size:11px;")
+        lay.addWidget(self.lbl_status)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        self.btn_verify = QPushButton("③ 校验并启用")
+        self.btn_verify.setMinimumHeight(36)
+        self.btn_verify.setMinimumWidth(130)
+        self.btn_verify.setCursor(Qt.PointingHandCursor)
+        self.btn_verify.setStyleSheet(
+            f"QPushButton{{background:{C_BLUE};color:#fff;border:none;border-radius:8px;}}"
+            f"QPushButton:hover{{background:{C_BLUE_HOVER};}}"
+            f"QPushButton:disabled{{background:#c9ced6;color:#fff;}}")
+        self.btn_verify.clicked.connect(self._verify)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("secondary")
+        btn_cancel.setMinimumHeight(36)
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.clicked.connect(self.reject)
+        foot.addStretch()
+        foot.addWidget(btn_cancel)
+        foot.addWidget(self.btn_verify)
+        lay.addLayout(foot)
+
+        self.verified.connect(self._on_verified)
+
+        # 预填已有凭据，避免用户重填
+        cfg = load_config()
+        fs = cfg.get("feishu") or {}
+        if fs.get("app_id"):
+            self.ed_id.setText(fs.get("app_id", ""))
+        if fs.get("app_secret"):
+            self.ed_secret.setText(fs.get("app_secret", ""))
+
+    # ---- 动作 ----
+    def _open_create(self):
+        """打开飞书创建应用页，同时把应用名放剪贴板。"""
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(feishu_setup.CREATE_URL))
+        except Exception:
+            log.exception("打开创建页失败")
+        self._copy_name(silent=True)
+        self.lbl_status.setText("已打开开发者后台，应用名已复制到剪贴板，直接粘贴即可。")
+
+    def _copy_name(self, silent: bool = False):
+        try:
+            QApplication.clipboard().setText(feishu_setup.DEFAULT_APP_NAME)
+            if not silent:
+                self.lbl_status.setText(
+                    f"已复制「{feishu_setup.DEFAULT_APP_NAME}」，到后台新建应用时粘贴。")
+        except Exception:
+            log.exception("写剪贴板失败")
+
+    def _verify(self):
+        app_id = self.ed_id.text().strip()
+        app_secret = self.ed_secret.text().strip()
+        if not app_id or not app_secret:
+            self.lbl_status.setText("App ID 和 App Secret 都要填。")
+            return
+        self.btn_verify.setEnabled(False)
+        self.btn_verify.setText("校验中…")
+        self.lbl_status.setStyleSheet(f"color:{C_SUB};font-size:11px;")
+        self.lbl_status.setText("正在连接飞书服务器校验凭据，最长 8 秒…")
+        self._pending = (app_id, app_secret)
+        # 网络请求必须离开主线程，否则窗口会假死
+        feishu_setup.verify_async(app_id, app_secret, self.verified.emit)
+
+    def _on_verified(self, res):
+        self.btn_verify.setEnabled(True)
+        self.btn_verify.setText("③ 校验并启用")
+        if getattr(res, "ok", False):
+            app_id, app_secret = self._pending or ("", "")
+            self.result_payload = {"app_id": app_id, "app_secret": app_secret}
+            self.lbl_status.setStyleSheet(f"color:{C_GREEN};font-size:12px;")
+            self.lbl_status.setText("✓ 凭据有效，已启用。")
+            # 让用户看到成功再关窗，避免一闪而过
+            QTimer.singleShot(600, self.accept)
+        else:
+            self.lbl_status.setStyleSheet(f"color:{C_RED};font-size:12px;")
+            self.lbl_status.setText(getattr(res, "error", "校验失败"))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     start_hidden = "--background" in argv
@@ -806,8 +1046,11 @@ def main(argv: list[str] | None = None) -> int:
     app.setQuitOnLastWindowClosed(False)
 
     from PySide6.QtWidgets import QSystemTrayIcon
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        log.warning("系统托盘不可用，窗口关闭后进程仍会驻留")
+    tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+    if not tray_ok:
+        # 托盘不可用时必须让窗口自己站出来：否则进程被 quitOnLastWindowClosed=False
+        # 吊着，用户既没有图标也没有窗口，只能去任务管理器里找。
+        log.warning("系统托盘不可用，改为直接显示窗口（关闭窗口后进程仍会驻留）")
 
     w = RecWindow(start_hidden=start_hidden)
 
@@ -816,9 +1059,13 @@ def main(argv: list[str] | None = None) -> int:
     lock.start()
     app._instance_lock = lock          # 保引用，防止被回收
 
-    if start_hidden:
+    # 后台模式本该只留托盘；但托盘不可用或图标 show() 后不可见时，
+    # 静默驻留等于让应用变成隐形进程 —— 这时候宁可弹出窗口。
+    if start_hidden and tray_ok and w._tray_visible:
         log.info("后台模式启动，仅驻留托盘")
     else:
+        if start_hidden:
+            log.info("托盘不可用或图标未显示，改为显示窗口")
         w.show()
 
     rc = app.exec()
