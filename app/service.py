@@ -167,7 +167,7 @@ class RecService:
                     "msg": f"麦克风被占用，无法录音{who}",
                     "status": self.status(),
                 }
-            miclock_write_holder("Project-record-GUI版")
+            miclock_write_holder("open-record-GUI版")
             if self._phase == "transcribing":
                 log.warning("上一场仍在转写，CPU 可能吃紧")
             try:

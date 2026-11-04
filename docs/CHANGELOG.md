@@ -103,7 +103,7 @@ HKLM 需要管理员权限、会弹 UAC；HKCU 普通用户双击即生效。代
 
 ### 产物
 
-- `dist/Project-record-YYYYMMDD.zip` — 分发包，48.4MB
+- `dist/open-record-YYYYMMDD.zip` — 分发包，48.4MB
 - 完整性自检 17 项全 OK（新增 tray/singleton/autostart/assets 检查项）
 
 ### 仍未修（需另行拍板）
@@ -118,7 +118,7 @@ HKLM 需要管理员权限、会弹 UAC；HKCU 普通用户双击即生效。代
 
 ### 做了什么
 
-把原先常驻后台的录音服务改造为**双击即用的桌面工具**，并独立成 Project-record 项目准备开源。
+把原先常驻后台的录音服务改造为**双击即用的桌面工具**，并独立成 open-record 项目准备开源。
 
 ### 关键决策
 
@@ -185,8 +185,8 @@ sounddevice + PortAudio、numpy、lameenc、lark_oapi。
 
 ### 产物
 
-- `dist/Project-record-YYYYMMDD.zip` — 分发包，48.3MB
-- `dist/Project-record/` — 未压缩发行目录，134MB
+- `dist/open-record-YYYYMMDD.zip` — 分发包，48.3MB
+- `dist/open-record/` — 未压缩发行目录，134MB
 
 ### 遗留
 

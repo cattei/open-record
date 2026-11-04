@@ -17,9 +17,9 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
-DIST_NAME = "Project-record"
+DIST_NAME = "open-record"
 STAGE = PROJECT / "dist" / DIST_NAME
-ZIP_OUT = PROJECT / "dist" / f"Project-record-{datetime.now():%Y%m%d}.zip"
+ZIP_OUT = PROJECT / "dist" / f"open-record-{datetime.now():%Y%m%d}.zip"
 
 # 默认值真源在 app/config.py，这里不再抄第四份（原来端口写 8899 已漂移）。
 sys.path.insert(0, str(PROJECT / "app"))

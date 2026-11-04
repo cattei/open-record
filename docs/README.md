@@ -1,4 +1,4 @@
-# Project-record
+# open-record
 
 一个**纯本地运行**的录音工具。点一下开始，点一下停止，录音文件自动存到你指定的目录。
 
@@ -202,12 +202,14 @@ Windows 会把不常用的托盘图标收进「隐藏的图标」里（点任务
 ## 目录结构
 
 ```
-Project-record\
+open-record\
 ├── 启动录音助手.bat      双击启动（已在运行时则唤出窗口）
 ├── config.json           配置
 ├── app\                  源码
 │   ├── launcher.py       入口（依赖自检）
 │   ├── gui.py            界面
+│   ├── config.py         配置默认值与深合并（唯一真源）
+│   ├── miclock.py        跨进程麦克风互斥
 │   ├── tray.py           右下角托盘图标与菜单
 │   ├── autostart.py      开机自启（写 HKCU Run，免提权）
 │   ├── singleton.py      单实例锁（避免开两份抢麦克风）
@@ -217,6 +219,8 @@ Project-record\
 │   ├── feishu.py         飞书通道（可选）
 │   ├── asr.py            转写（默认不用）
 │   └── assets\           图标（蓝=待命 / 红=录音）
+├── packaging\            构建脚本（打包、生成图标）
+├── tests\                回归测试（22 项断言）
 ├── runtime\python\       内置 Python 运行时
 ├── recordings\           录音输出
 └── logs\                 运行日志

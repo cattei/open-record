@@ -17,8 +17,8 @@ python packaging/build_runtime.py
 python packaging/package.py
 
 # 3. 产物
-#    dist/Project-record/            未压缩，可直接运行
-#    dist/Project-record-YYYYMMDD.zip  分发包
+#    dist/open-record/            未压缩，可直接运行
+#    dist/open-record-YYYYMMDD.zip  分发包
 ```
 
 ## 为什么不用 PyInstaller

@@ -29,7 +29,7 @@ MUTEX_NAME = "Local\\RecAssistant_Microphone_Lock"
 # 两套程序的 HTTP 端口，用于互相探测
 PEERS = {
     "RecAssistant-旧服务": 8899,
-    "Project-record-GUI版": 8898,
+    "open-record-GUI版": 8898,
 }
 
 _local = threading.local()

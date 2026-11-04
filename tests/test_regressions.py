@@ -1,5 +1,5 @@
 """
-Project-record 回归测试
+open-record 回归测试
 =======================
 覆盖审计（docs/AUDIT-2026-11-03.md）里的每个缺陷，一条缺陷至少一个用例。
 
@@ -352,7 +352,7 @@ def test_writer_reuse():
 
 def main():
     print("=" * 60)
-    print("Project-record 回归测试")
+    print("open-record 回归测试")
     print("=" * 60)
     test_chunk_length()
     test_stop_extra_audio()
