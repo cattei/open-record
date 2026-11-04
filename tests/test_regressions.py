@@ -350,6 +350,55 @@ def test_writer_reuse():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_feishu_bot_ctor_order():
+    """GUI 启动飞书时的参数顺序必须是 (app_id, app_secret, service)。
+
+    历史缺陷：gui.py 曾写成 FeishuBot(self.svc, app_id, app_secret)，
+    与签名 (app_id, app_secret, service) 对不上，结果把 Service 对象
+    当作 app_id 传给 lark.ws.Client，飞书长连接必然连不上，而且
+    except 分支只打一行日志，表面上「已启用」，实际完全不通。
+    这条用 AST 静态检查调用点，不需要真的连飞书。
+    """
+    import ast
+
+    src = (APP / "gui.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+            if name == "FeishuBot":
+                calls.append(node)
+
+    check("gui.py 里有 FeishuBot 调用", len(calls) >= 1, f"找到 {len(calls)} 处")
+
+    ok = True
+    detail = ""
+    for call in calls:
+        if len(call.args) < 3:
+            ok = False
+            detail = "参数不足 3 个"
+            break
+        first = call.args[0]
+        # 第一个实参必须是取值表达式（fs.get(...) / fcfg[...]），
+        # 不能是 self.svc / svc 这类 Service 对象
+        is_value_expr = isinstance(first, (ast.Call, ast.Subscript))
+        if not is_value_expr:
+            ok = False
+            detail = f"第一个实参是 {ast.dump(first)[:60]}，疑似把 Service 当成 app_id"
+            break
+
+    check("FeishuBot 第一个实参是 app_id 而非 service", ok, detail)
+
+    # 第三位应该能看到 self.svc / svc
+    if calls:
+        third = calls[0].args[2] if len(calls[0].args) >= 3 else None
+        third_src = ast.dump(third)[:60] if third is not None else ""
+        has_svc = third is not None and "svc" in third_src
+        check("FeishuBot 第三个实参是 service", has_svc, third_src)
+
 def main():
     print("=" * 60)
     print("open-record 回归测试")
@@ -364,6 +413,7 @@ def main():
     test_prebuffer_honest()
     test_finish_session_lock()
     test_writer_reuse()
+    test_feishu_bot_ctor_order()
 
     print("\n" + "=" * 60)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")

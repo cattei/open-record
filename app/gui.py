@@ -475,7 +475,9 @@ class RecWindow(QMainWindow):
         def work():
             try:
                 from feishu import FeishuBot
-                bot = FeishuBot(self.svc, fs.get("app_id", ""), fs.get("app_secret", ""))
+                # 注意参数顺序是 (app_id, app_secret, service)，
+                # 与 main.py 的调用保持一致；写反会把 Service 当 app_id 传给 SDK。
+                bot = FeishuBot(fs.get("app_id", ""), fs.get("app_secret", ""), self.svc)
                 bot.start()
                 self._feishu_bot = bot
                 self._emit_log("飞书长连接已启用")
