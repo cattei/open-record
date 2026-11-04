@@ -67,6 +67,7 @@ C_BLUE = "#2f6bff"
 C_BLUE_HOVER = "#1f5ae8"
 C_RED = "#e5352b"
 C_GREEN = "#1a9c62"
+C_ORANGE = "#c26a00"
 
 # 注意：Qt 里 QLabel 继承自 QFrame，用 `QFrame{...}` 选择器会把边框糊到所有标签上。
 # 所以卡片一律走 objectName，标签走类型选择器显式清掉边框。
@@ -879,6 +880,8 @@ class FeishuSetupDialog(QDialog):
         self.setMinimumWidth(560)
         self.result_payload: dict | None = None
         self._pending: tuple[str, str] | None = None
+        # 已经提示过「能启用但可能收不到消息」，用户再点一次即视为确认
+        self._warn_ack = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 20, 22, 18)
@@ -989,6 +992,16 @@ class FeishuSetupDialog(QDialog):
             log.exception("写剪贴板失败")
 
     def _verify(self):
+        # 已经看过警告、用户再点一次 → 表示「我知道，仍然启用」。
+        # 但只在凭据没被改动时才生效：用户改完 App ID/Secret 再来点，
+        # 显然是想重新校验，不能直接关窗把新凭据吞掉。
+        if getattr(self, "_warn_ack", False):
+            cur = (self.ed_id.text().strip(), self.ed_secret.text().strip())
+            if cur == getattr(self, "_pending", None):
+                self.accept()
+                return
+            self._warn_ack = False
+            self.btn_verify.setText("③ 校验并启用")
         app_id = self.ed_id.text().strip()
         app_secret = self.ed_secret.text().strip()
         if not app_id or not app_secret:
@@ -1008,10 +1021,25 @@ class FeishuSetupDialog(QDialog):
         if getattr(res, "ok", False):
             app_id, app_secret = self._pending or ("", "")
             self.result_payload = {"app_id": app_id, "app_secret": app_secret}
-            self.lbl_status.setStyleSheet(f"color:{C_GREEN};font-size:12px;")
-            self.lbl_status.setText("✓ 凭据有效，已启用。")
-            # 让用户看到成功再关窗，避免一闪而过
-            QTimer.singleShot(600, self.accept)
+            warns = list(getattr(res, "warnings", []) or [])
+            if warns:
+                # 凭据没问题，但很可能收不到消息。仍然允许启用（刚建好的应用
+                # 本来就没有会话），但必须把「去后台查哪一项」说清楚，
+                # 否则用户会遇到「显示已启用、飞书发消息没反应」。
+                self.lbl_status.setStyleSheet(f"color:{C_ORANGE};font-size:11px;")
+                self.lbl_status.setText(
+                    "⚠ 凭据有效，但还需确认：\n"
+                    + "\n".join(f"· {w}" for w in warns)
+                    + "\n\n点「仍然启用」继续，或改好后重新校验。")
+                self._warn_ack = True
+                self.btn_verify.setText("③ 仍然启用")
+            else:
+                self.lbl_status.setStyleSheet(f"color:{C_GREEN};font-size:12px;")
+                name = getattr(res, "app_name", "") or ""
+                self.lbl_status.setText(
+                    f"✓ 凭据有效，已启用{f'（{name}）' if name else ''}。")
+                # 让用户看到成功再关窗，避免一闪而过
+                QTimer.singleShot(600, self.accept)
         else:
             self.lbl_status.setStyleSheet(f"color:{C_RED};font-size:12px;")
             self.lbl_status.setText(getattr(res, "error", "校验失败"))

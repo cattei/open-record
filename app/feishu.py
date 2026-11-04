@@ -336,6 +336,10 @@ class FeishuBot:
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_message)
+            # 飞书还会推「消息已读」等事件。不注册处理器时 SDK 会打
+            # 「processor not found」的 ERROR，看着像故障其实无害。
+            # 这里注册一个空处理器吞掉，保持日志干净——真正出问题时才显眼。
+            .register_p2_im_message_message_read_v1(lambda _d: None)
             .build()
         )
         self._ws = lark.ws.Client(

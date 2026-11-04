@@ -410,6 +410,29 @@ def test_feishu_prebuffer_field():
           f"读到的字段={gets}")
 
 
+def test_feishu_warn_ack_resets_on_edit():
+    """向导里的「仍然启用」确认，必须在凭据被改动后失效。
+
+    设计：凭据有效但权限可能没开时，界面标橙并提示去后台确认，
+    用户再点一次按钮表示「我知道，仍然启用」。但若用户改了 App ID/Secret
+    再点，显然是想重新校验——此时若还走确认分支直接关窗，
+    新凭据会被静默吞掉，用户以为校验过了其实没有。
+
+    用源码结构校验：确认分支里必须比较当前输入与 _pending。
+    """
+    print("\\n[P2] 飞书「仍然启用」确认需随凭据变更失效")
+    src = (APP / "gui.py").read_text(encoding="utf-8")
+
+    i = src.find("def _verify(self)")
+    j = src.find("def _on_verified(self)")
+    block = src[i:j]
+    check("确认分支存在", "_warn_ack" in block, "未找到 _warn_ack")
+    check("确认前比较当前凭据",
+          "cur" in block and "_pending" in block,
+          "缺少与 _pending 的比较，改凭据后会被误确认")
+    check("凭据变了就重置确认", "_warn_ack = False" in block,
+          "未重置 _warn_ack")
+
 def test_feishu_bot_ctor_order():
     """GUI 启动飞书时的参数顺序必须是 (app_id, app_secret, service)。
 
@@ -474,6 +497,7 @@ def main():
     test_finish_session_lock()
     test_writer_reuse()
     test_feishu_bot_ctor_order()
+    test_feishu_warn_ack_resets_on_edit()
     test_feishu_prebuffer_field()
 
     print("\n" + "=" * 60)

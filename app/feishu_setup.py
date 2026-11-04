@@ -31,6 +31,8 @@ CONSOLE_URL = "https://open.feishu.cn/app"
 CREATE_URL = "https://open.feishu.cn/app?from=create"          # 创建应用页
 PERMISSION_URL = "https://open.feishu.cn/app/{app_id}/auth"     # 该应用的权限管理页
 TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+BOT_INFO_URL = "https://open.feishu.cn/open-apis/bot/v3/info"
+CHATS_URL = "https://open.feishu.cn/open-apis/im/v1/chats?page_size=1"
 
 # 长连接收消息 + 回消息所需的最小权限集。
 # im:message 负责接收消息事件；im:message:send_as_bot 负责以机器人身份发消息。
@@ -45,12 +47,18 @@ DEFAULT_APP_NAME = "录音助手"
 
 @dataclass
 class VerifyResult:
-    """凭据校验结果。ok=False 时 error 一定是能直接展示给用户的中文句子。"""
+    """凭据校验结果。ok=False 时 error 一定是能直接展示给用户的中文句子。
+
+    warnings 用于「能启用、但很可能收不到消息」的情况：这类问题不该阻断启用
+    （用户可能是刚建好应用、还没发消息，群列表本来就是空的），但必须明确告诉他
+    去后台检查哪一项，否则就会出现「界面显示已启用、发消息却没反应」。
+    """
 
     ok: bool
     error: str = ""
     app_name: str = ""
     scopes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def looks_like_app_id(s: str) -> bool:
@@ -75,16 +83,47 @@ def _http_post_json(url: str, payload: dict, timeout: float = 8.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def verify_credentials(app_id: str, app_secret: str, timeout: float = 8.0) -> VerifyResult:
-    """用 tenant_access_token 接口校验 App ID / Secret 是否有效。
+def _http_get_json(url: str, token: str, timeout: float = 8.0) -> dict:
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}"}, method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-    这是飞书鉴权的第一步：凭据错会直接返回 code != 0，不需要任何业务权限，
-    所以可以拿它当「凭据自检」。整个过程不落盘、不打印密钥。
+
+def _http_get_error(url: str, token: str, timeout: float = 8.0) -> dict:
+    """GET 请求，把飞书返回的错误 JSON 也解析出来（4xx 才有 body）。
+
+    飞书的权限类错误通常用 HTTP 400 + body 里的 code 表达，不解析 body
+    就只能看到一个笼统的 400，用户完全不知道该去开哪个权限。
+    """
+    try:
+        return _http_get_json(url, token, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"code": e.code, "msg": str(e)}
+
+
+def verify_credentials(app_id: str, app_secret: str, timeout: float = 8.0) -> VerifyResult:
+    """校验凭据，并尽力查出「能不能真的收到消息」。
+
+    三层校验，一层比一层接近真实使用：
+
+      1. **凭据**：tenant_access_token 接口。凭据错会直接 code != 0，不需要
+         任何业务权限，所以拿它当凭据自检。
+      2. **机器人能力**：bot/v3/info。这一步能拿到 app_name，也确认「机器人」
+         应用能力已启用——没启用会返回错误码。
+      3. **收消息权限**：im/v1/chats。这一步是本次新增的关键：拿不到群列表
+         通常意味着 im:message 权限没开或没发布，而这种情况**凭据依然有效**，
+         所以第 1 层根本发现不了。旧版只做第 1 层，于是会出现「界面显示已启用、
+         飞书发消息却完全没反应」。
 
     校验能区分三类问题，这对用户很重要：
       · 10003 / 10014 之类 → ID 或 Secret 写错
       · 网络异常          → 断网或代理，不是填错
-      · 其它 code         → 应用被停用/权限问题，原样透出 code 与 msg
+      · 权限类 code       → 凭据对，但收不到消息，必须去后台开通并发布版本
     """
     app_id = (app_id or "").strip()
     app_secret = (app_secret or "").strip()
@@ -133,7 +172,41 @@ def verify_credentials(app_id: str, app_secret: str, timeout: float = 8.0) -> Ve
             hint = "\n应用可能已停用，或被管理员限制，请到后台确认应用状态。"
         return VerifyResult(False, f"凭据无效（code={code}）：{msg}{hint}")
 
-    return VerifyResult(True)
+    # 凭据有效。继续查「能不能收到消息」，但这一步失败不阻断启用，
+    # 只作为 warning 交给界面展示——否则刚建好的应用会被误判为不可用。
+    token = body.get("tenant_access_token") or ""
+    app_name = ""
+    warnings: list[str] = []
+
+    if token:
+        bot = _http_get_error(BOT_INFO_URL, token, timeout=timeout)
+        if bot.get("code") == 0:
+            app_name = (bot.get("bot") or {}).get("app_name") or ""
+        else:
+            warnings.append(
+                f"机器人能力可能没启用（code={bot.get('code')}）。"
+                "请到后台「添加应用能力」里启用「机器人」并发布版本。"
+            )
+
+        chats = _http_get_error(CHATS_URL, token, timeout=timeout)
+        ccode = chats.get("code")
+        # 注意：im/v1/chats 只返回**群聊**，不返回单聊。绝大多数用户是跟机器人
+        # 单聊的，这种情况下 items 必然是空的——所以「空列表」是正常状态，
+        # 绝不能当成故障报警（否则会对完全正常的配置误报）。
+        # 这里只把「接口报错」当作权限缺失的证据：能成功返回就说明 im:message 在。
+        if ccode in (99991672, 99991663, 99991679, 41050):
+            warnings.append(
+                f"缺少接收消息的权限（code={ccode}）。"
+                "请到「权限管理」开通 im:message 与 im:message:send_as_bot，"
+                "并**发布新版本**——权限改动不发布不生效。"
+            )
+        elif ccode not in (0, None):
+            warnings.append(
+                f"查询会话列表返回 code={ccode}：{chats.get('msg') or ''}。"
+                "若之后飞书发消息没反应，请到后台检查权限与事件订阅。"
+            )
+
+    return VerifyResult(True, app_name=app_name, warnings=warnings)
 
 
 def apply_to_config(cfg: dict, app_id: str, app_secret: str) -> dict:

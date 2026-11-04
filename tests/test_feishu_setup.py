@@ -58,10 +58,23 @@ class TestVerifyLocalShortCircuit(unittest.TestCase):
 class TestErrorTranslation(unittest.TestCase):
     """错误码 -> 人话。用打桩替换网络层，保证测试离线可跑。"""
 
-    def _stub(self, body):
-        orig = fs._http_post_json
+    def _stub(self, body, bot=None, chats=None):
+        """同时替换 POST 与 GET。
+
+        新增的机器人能力/会话列表校验都走 GET，只打桩 POST 会让测试
+        带着假 token 去请求真实飞书接口（既慢又不可复现）。
+        bot/chats 默认给「正常」返回值，需要异常场景时显式传入。
+        """
+        orig_post = fs._http_post_json
+        orig_get = fs._http_get_error
         fs._http_post_json = lambda url, payload, timeout=8.0: body
-        self.addCleanup(lambda: setattr(fs, "_http_post_json", orig))
+        fs._http_get_error = lambda url, token, timeout=8.0: (
+            bot if ("bot/v3/info" in url and bot is not None)
+            else chats if chats is not None
+            else {"code": 0, "data": {"items": [{"chat_id": "oc_fake"}]}}
+        )
+        self.addCleanup(lambda: setattr(fs, "_http_post_json", orig_post))
+        self.addCleanup(lambda: setattr(fs, "_http_get_error", orig_get))
 
     def test_ok_code(self):
         self._stub({"code": 0, "tenant_access_token": "t-fake"})
@@ -81,6 +94,77 @@ class TestErrorTranslation(unittest.TestCase):
         r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
         self.assertFalse(r.ok)
         self.assertIn("停用", r.error)
+
+
+class TestReceivabilityCheck(unittest.TestCase):
+    """凭据有效 ≠ 能收到消息。
+
+    真实事故：界面显示「飞书已启用」，但在飞书里发消息完全没反应。
+    原因是旧版校验只调 tenant_access_token —— 那只证明 App ID/Secret 对，
+    不证明 im:message 权限开了、也不证明事件订阅配成了长连接。
+    所以这里要求校验额外查「机器人能力」与「会话列表」，把这类问题
+    在启用之前就提示出来。
+    """
+
+    def _stub(self, body, bot=None, chats=None):
+        orig_post = fs._http_post_json
+        orig_get = fs._http_get_error
+        fs._http_post_json = lambda url, payload, timeout=8.0: body
+        fs._http_get_error = lambda url, token, timeout=8.0: (
+            bot if ("bot/v3/info" in url and bot is not None)
+            else chats if chats is not None
+            else {"code": 0, "data": {"items": [{"chat_id": "oc_fake"}]}}
+        )
+        self.addCleanup(lambda: setattr(fs, "_http_post_json", orig_post))
+        self.addCleanup(lambda: setattr(fs, "_http_get_error", orig_get))
+
+    def test_healthy_app_has_no_warnings(self):
+        self._stub({"code": 0, "tenant_access_token": "t-fake"},
+                   bot={"code": 0, "bot": {"app_name": "GT-Record"}},
+                   chats={"code": 0, "data": {"items": [{"chat_id": "oc_x"}]}})
+        r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.warnings, [])
+        self.assertEqual(r.app_name, "GT-Record")
+
+    def test_empty_chat_list_is_normal(self):
+        """空会话列表是正常状态，绝不能报警。
+
+        真实误报：im/v1/chats 只返回**群聊**，不返回单聊。绝大多数用户
+        是跟机器人单聊，items 必然为空。第一版把空列表当故障提示，
+        对完全正常的配置（实测 GT-Record）误报了「还没有加入任何会话」。
+        能成功返回本身就是 im:message 权限已开的证据。
+        """
+        self._stub({"code": 0, "tenant_access_token": "t-fake"},
+                   chats={"code": 0, "data": {"items": []}})
+        r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.warnings, [])
+
+    def test_permission_denied_warns_about_scope(self):
+        """权限没开时凭据依然有效——这正是旧版漏掉的情况。"""
+        self._stub({"code": 0, "tenant_access_token": "t-fake"},
+                   chats={"code": 99991672, "msg": "no permission"})
+        r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
+        self.assertTrue(r.ok)                       # 仍然允许启用
+        joined = " ".join(r.warnings)
+        self.assertIn("im:message", joined)
+        self.assertIn("发布", joined)               # 提醒必须发版本
+
+    def test_bot_capability_missing_warns(self):
+        self._stub({"code": 0, "tenant_access_token": "t-fake"},
+                   bot={"code": 10021, "msg": "bot not enabled"})
+        r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
+        self.assertTrue(r.ok)
+        joined = " ".join(r.warnings)
+        self.assertIn("机器人", joined)
+
+    def test_credential_failure_short_circuits(self):
+        """凭据就错的时候不该再去查权限，直接失败返回。"""
+        self._stub({"code": 10003, "msg": "invalid param"})
+        r = fs.verify_credentials("cli_a1b2c3d4e5f6g7h8", "s")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.warnings, [])
 
 
 class TestConfigApply(unittest.TestCase):
