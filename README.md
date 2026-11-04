@@ -9,6 +9,8 @@
 
 <img src="promo/guide/assets/02-main-window-idle.png" width="420" alt="主界面">
 
+**▶ [看 55 秒使用演示视频](promo/demo/使用演示.mp4)** — 双击就能播，不用装播放器
+
 ---
 
 ## 目录
@@ -332,8 +334,9 @@ Python 打包，未做数字签名。若被拦，添加信任或检查源码后�
 
 | 想做什么 | 看这里 |
 |---|---|
+| **看一段 55 秒视频就懂**（不用装东西，双击就播） | [promo/demo/使用演示.mp4](promo/demo/使用演示.mp4) |
 | 完整图文使用指南（含全部截图） | [promo/guide/使用指南.html](promo/guide/使用指南.html) |
-| 10 步交互动画演示（双击就能看） | [promo/demo/index.html](promo/demo/index.html) |
+| 10 步交互动画演示（可自己翻页） | [promo/demo/index.html](promo/demo/index.html) |
 | 更详细的开发文档、参数与已知限制 | [docs/README.md](docs/README.md) |
 | 变更记录 | [docs/CHANGELOG.md](docs/CHANGELOG.md) |
 | 依赖说明 | [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) |

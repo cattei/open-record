@@ -13,7 +13,8 @@
 promo/
 ├── README.md                    ← 本文件，材料索引
 ├── demo/
-│   └── index.html               ← 交互动画演示（10 步，单文件，双击就看）
+│   ├── index.html               ← 交互动画演示（10 步，单文件，双击就看）
+│   └── 使用演示.mp4             ← 55 秒视频版（H.264，双击就播，可直接发微信）
 ├── guide/
 │   ├── 使用指南.md               ← 完整使用指南（Markdown 源）
 │   ├── 使用指南.html             ← 同上的自包含 HTML（图片内嵌，可直接转发）
@@ -45,6 +46,10 @@ promo/
 
 10 步交互动画：从双击启动、托盘图标、开始/停止录音、右键菜单，到飞书配置与校验失败。支持「自动播放」、上/下一步、点圆点跳转，键盘 ← → 翻页、空格播放/暂停。也是单文件自包含，双击就能看。
 
+**想直接看视频** → 打开 [`demo/使用演示.mp4`](demo/使用演示.mp4)
+
+55 秒，1600×900，H.264 / yuv420p——Windows 自带播放器、微信、手机都能直接播，不用装任何东西。内容与上面的交互动画是同一套 10 步，适合发群、发朋友圈、给不会用 GitHub 的人看。
+
 **想改内容再重新生成** → 编辑 [`guide/使用指南.md`](guide/使用指南.md)，然后跑：
 
 ```bat
@@ -52,6 +57,18 @@ runtime\python\python.exe promo\assets\_tools\build_guide_html.py
 ```
 
 会重新生成 `guide/使用指南.html`。
+
+视频演示是两步（先抽数据，再合成；顺序不能反）：
+
+```bat
+runtime\python\python.exe promo\assets\_tools\extract_demo_steps.py
+runtime\python\python.exe promo\assets\_tools\build_demo_mp4.py
+```
+
+会重新生成 `demo/使用演示.mp4`（1600×900 / 30fps / 约 55 秒 / 1.9MB）。
+**依赖**：系统 Python（`C:\env\python\python.exe`）里的 `av`(PyAV, 含 libx264) 与 `Pillow`；
+内置运行时 `runtime\python\` 没有这两个包，别用它跑。
+改了 `demo/index.html` 的文案或聚光灯坐标后，重跑上面两步视频才会跟着变。
 
 ---
 
@@ -130,6 +147,7 @@ runtime\python\python.exe promo\assets\_tools\build_guide_html.py
 | 文件 | 用途 | 能直接发人吗 |
 |---|---|---|
 | `demo/index.html` | 10 步交互动画演示 | ✅ 单文件，可直接发 |
+| `demo/使用演示.mp4` | 55 秒视频演示（H.264/yuv420p） | ✅ 双击就播，可直接发微信/群 |
 | `guide/使用指南.html` | 完整图文指南 | ✅ 单文件，可直接发 |
 | `guide/使用指南.md` | 同上，源文件 | ✅ 纯文本 |
 | `guide/assets/*.png` | 配图素材 | ✅ 单独也能用 |
