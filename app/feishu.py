@@ -194,10 +194,15 @@ class FeishuBot:
                 label = self._extract_label(text)
                 r = self.svc.cmd_start(label)
                 if r.get("ok"):
-                    pre = r["status"].get("prebuffer_sec", 0)
+                    # 注意：status() 里的 prebuffer_sec 是「预录容量」（配置值，
+                    # 比如 15），不是真正并入的时长；真正并入量看 prebuffer_filled。
+                    # 之前这里读 prebuffer_sec，导致预录没开时也会报「已并入预录 15 秒」，
+                    # 而停止后又按实际并入量报「含预录 0 秒」，两条消息自相矛盾。
+                    st = r.get("status") or {}
+                    pre = st.get("prebuffer_filled", 0) or 0
                     msg = f"🔴 已开始录音\n会话：{r['session_id']}\n"
-                    if pre and pre > 1:
-                        msg += f"已并入预录：{pre} 秒\n"
+                    if pre > 1:
+                        msg += f"已并入预录：{pre:.0f} 秒\n"
                     msg += "说完发「停止」即可。"
                     self.send_text(chat_id, msg)
                 else:

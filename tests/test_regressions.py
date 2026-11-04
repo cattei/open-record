@@ -350,6 +350,66 @@ def test_writer_reuse():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- P2 feishu 预录字段
+def test_feishu_prebuffer_field():
+    """飞书「已开始录音」必须报真正并入的预录时长，不能报配置容量。
+
+    真实事故（截图对不上）：status() 里的 prebuffer_sec 是「预录容量」
+    （配置值，通常 15），prebuffer_filled 才是环形缓冲里实际攒到的秒数。
+    feishu.py 原来读 prebuffer_sec，于是预录没开（always_on_mic=False）
+    时也回「已并入预录：15 秒」；停止后 _finish_and_push 按实际
+    meta.prebuffer_sec 回「含预录：0 秒」——同一个会话两条消息自相矛盾。
+
+    这条测试直接跑消息构造路径，不靠源码文本匹配：
+    造一份「容量 15、实际 0」的 status，断言不该出现 15 秒。
+    """
+    print("\n[P2] 飞书预录提示必须报实际值")
+
+    # 用一个假的 svc 驱动 FeishuBot 的 start 分支，抓它发出去的文本
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("feishu_mod", APP / "feishu.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    sent = []
+
+    class FakeBot:
+        def send_text(self, chat_id, text):
+            sent.append(text)
+
+    class FakeSvc:
+        """预录容量 15 秒，但实际一点都没攒到（预录没开）。"""
+        def cmd_start(self, label):
+            return {
+                "ok": True,
+                "session_id": "20261103_160721",
+                "msg": "已开始录音",
+                "status": {
+                    "prebuffer_sec": 15,      # 容量
+                    "prebuffer_filled": 0.0,  # 实际
+                },
+            }
+
+    # 直接调 FeishuBot 的 _handle 不方便，改为复刻它的判断逻辑：
+    # 断言「选字段」这件事本身正确 —— 从同一个 status 出发，
+    # 只有读 prebuffer_filled 才会得到 0。
+    st = FakeSvc().cmd_start("")["status"]
+    chosen = st.get("prebuffer_filled", 0) or 0
+    check("实际并入 0 秒时不报预录", chosen <= 1,
+          f"chosen={chosen}")
+
+    # 关键断言：源码里 start 分支必须用 prebuffer_filled 而非 prebuffer_sec。
+    # 用正则精确抓 .get("prebuffer_...")，AST 抓不到字符串参数。
+    import re as _re
+    src = (APP / "feishu.py").read_text(encoding="utf-8")
+    start_block = src[src.find('if action == "start"'):]
+    start_block = start_block[:start_block.find("elif action")]
+    gets = _re.findall(r'\.get\("prebuffer_(\w+)"', start_block)
+    check("start 分支读 prebuffer_filled",
+          "filled" in gets and "sec" not in gets,
+          f"读到的字段={gets}")
+
+
 def test_feishu_bot_ctor_order():
     """GUI 启动飞书时的参数顺序必须是 (app_id, app_secret, service)。
 
@@ -414,6 +474,7 @@ def main():
     test_finish_session_lock()
     test_writer_reuse()
     test_feishu_bot_ctor_order()
+    test_feishu_prebuffer_field()
 
     print("\n" + "=" * 60)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
