@@ -58,14 +58,14 @@ strong{color:var(--text)}
 <ul>
 <li><strong>开会、访谈、讲座</strong>：不想一边听一边记，先录下来，回头整理</li>
 <li><strong>灵感随手记</strong>：脑子里冒出个想法，点一下就录，不用开一堆软件</li>
-<li><strong>不想把录音传到别人服务器</strong>：所有音频只留在本机</li>
+<li><strong>不想把录音传到别人服务器</strong>：默认状态下所有音频只留在本机</li>
 </ul>
 <p>它的三个特点：</p>
 <table><thead><tr>
 <th>特点</th><th>具体是什么</th>
 </tr></thead><tbody>
 <tr><td><strong>无感</strong></td><td>首次运行自动设为开机自启，之后常驻右下角托盘，不占任务栏、不弹窗</td></tr>
-<tr><td><strong>纯本地</strong></td><td>录音不经过任何服务器。飞书远程控制是可选功能，不开也能正常用</td></tr>
+<tr><td><strong>纯本地</strong></td><td>默认状态下录音不经过任何服务器。只有你主动启用飞书远程控制时，发「停止」才会把当次 mp3 上传到飞书服务器发回给你；不开就完全没有这条路径</td></tr>
 <tr><td><strong>不用装环境</strong></td><td>运行时（Python + 依赖）已内置在 <code>runtime\</code> 里，解压即用</td></tr>
 </tbody></table>
 <hr>
@@ -321,8 +321,12 @@ runtime\python\python.exe app\launcher.py --status</code></pre>
 <hr>
 <h2>隐私说明</h2>
 <ul>
-<li>录音<strong>只存在本机</strong>，不上传任何服务器</li>
+<li>默认状态下录音<strong>只存在本机</strong>，没有任何上传逻辑</li>
 <li>默认<strong>不联网</strong>。只有你主动启用飞书功能时，才会连飞书开放平台</li>
+<li><strong>例外：启用飞书后，你发「停止」时程序会把当次 mp3 上传到飞书服务器再发回给你。</strong></li>
+</ul>
+<p>开了飞书，录音就不再「只在本机」——这是这个功能本身的代价，不是程序偷偷传的。 不配飞书就完全没有这条路径</p>
+<ul>
 <li>飞书 App Secret 存在本机 <code>config.json</code> 里，不会外发</li>
 <li>代码全部开源，可自行审查</li>
 </ul>

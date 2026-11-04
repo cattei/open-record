@@ -64,6 +64,10 @@ runtime\python\python.exe promo\assets\_tools\build_guide_html.py
 
 适合放在 GitHub 简介、群聊介绍、朋友圈第一行。
 
+> 对外发布时**建议加一句限定**：「默认不联网；只有你主动开启飞书远程控制时，
+> 发停止会把当次 mp3 上传到飞书服务器发回给你」。不加这句，开了飞书的用户
+> 会以为录音只在本机——这不是小事，别省这半句话。
+
 ### 2. 一分钟版（看截图就懂）
 
 配 `02-main-window-idle.png` + `03-recording.png` + `04-tray-menu.png` 三张图：
