@@ -1,0 +1,26 @@
+# 用 Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+
+# 运行时（体积大，构建生成）
+runtime/
+
+# 用户数据
+recordings/
+logs/
+transcripts/
+config.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
