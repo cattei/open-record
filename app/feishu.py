@@ -31,6 +31,32 @@ from lark_oapi.api.im.v1 import (
 
 log = logging.getLogger("feishu")
 
+# 飞书 im/v1/file/create 的硬性上限（官方文档：文件大小不得超过 30 MB）。
+# 长录音很容易超过：192kbps 下 30MB 只够约 22 分钟，一小时就有 82MB。
+# 超限时接口必然失败，所以提前判断并把原因说清楚，而不是笼统报「发送失败」。
+FEISHU_FILE_LIMIT_MB = 30
+
+# 分段时每段的目标大小。比上限再留一点余量：接口按 HTTP body 计，
+# 多段 form 的边界字节也算在内，卡在 30.0 会偶发超限。
+SPLIT_TARGET_MB = 28
+
+# MPEG 帧长查表。注意要覆盖 MPEG1 和 MPEG2/2.5 —— lameenc 在低采样率
+# （≤24kHz，本程序默认 16kHz 就属于这类）下输出的是 **MPEG2 Layer III**，
+# 帧头 version bits = 2 而不是 3。只查 MPEG1 表会把合法帧判成非帧头，
+# 切分就退化成按字节硬切，从帧中间断开、播放器报「文件损坏」。
+_MP3_BITRATES = {
+    # (版本组, layer) -> 位率表（kbps）。版本组 1=MPEG1，2=MPEG2/2.5
+    (1, 3): (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0),
+    (2, 3): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+}
+_MP3_RATES = {
+    1: (44100, 48000, 32000, 0),      # MPEG1
+    2: (22050, 24000, 16000, 0),      # MPEG2
+}
+# 每帧样本数：MPEG1 L3 是 1152，MPEG2/2.5 L3 也是 1152
+_MP3_FRAME_SAMPLES = 1152
+
+SPLIT_WORDS = ("切分", "分割", "分片", "分段", "拆分", "split")
 CANCEL_WORDS = ("取消", "不要了", "删掉", "cancel")
 STOP_WORDS = ("停止", "停", "结束", "好了", "可以了", "stop", "够了")
 STATUS_WORDS = ("状态", "多久", "还在录", "进度", "status", "查询")
@@ -41,8 +67,121 @@ HELP = (
     "· 发「开始」或「录音」→ 开始录音\n"
     "· 发「停止」或「结束」→ 停止并把 mp3 发回这个聊天\n"
     "· 发「状态」→ 查看已录时长\n"
+    "· 发「切分」→ 把上一段超限的录音切段发过来\n"
     "· 发「取消」→ 丢弃本次录音"
 )
+
+
+def _mp3_frame_len(data: bytes, i: int) -> int:
+    """在偏移 i 处按 MPEG Layer III 帧头算出该帧字节数；不是帧头则返回 0。
+
+    同时支持 MPEG1（version bits=3）与 MPEG2/2.5（version bits=2/0）。
+    本程序默认 16kHz 采样，lameenc 会输出 MPEG2 L3——只认 MPEG1 是错的。
+
+    遇到不认识的字节返回 0，让上层退回按字节切——那种切法偶尔会在帧中间
+    断开，但绝大多数播放器仍能容错播放，总比完全发不出去好。
+    """
+    if i + 4 > len(data):
+        return 0
+    b1 = data[i + 1]
+    if data[i] != 0xFF or (b1 & 0xE0) != 0xE0:
+        return 0
+    ver_bits = (b1 >> 3) & 0x03
+    layer_bits = (b1 >> 1) & 0x03
+    if layer_bits != 1:                 # 只处理 Layer III
+        return 0
+    if ver_bits == 3:                   # MPEG1
+        vgrp, rate_tbl = 1, _MP3_RATES[1]
+    elif ver_bits == 2:                 # MPEG2
+        vgrp, rate_tbl = 2, _MP3_RATES[2]
+    elif ver_bits == 0:                 # MPEG2.5
+        vgrp, rate_tbl = 2, (11025, 12000, 8000, 0)
+    else:                               # 保留值
+        return 0
+    br_tbl = _MP3_BITRATES.get((vgrp, 3))
+    if not br_tbl:
+        return 0
+    br_idx = (data[i + 2] >> 4) & 0x0F
+    sr_idx = (data[i + 2] >> 2) & 0x03
+    pad = (data[i + 2] >> 1) & 0x01
+    br = br_tbl[br_idx] * 1000
+    sr = rate_tbl[sr_idx]
+    if br <= 0 or sr <= 0:
+        return 0
+    # MPEG1 L3: 1152 samples -> 144*br/sr；MPEG2/2.5 L3: 576 samples -> 72*br/sr
+    k = 144 if vgrp == 1 else 72
+    return k * br // sr + pad
+
+
+def split_mp3(path: Path, target_mb: int = SPLIT_TARGET_MB,
+              target_bytes: int | None = None) -> list[Path]:
+    """把大 mp3 切成若干段，每段都能独立播放。
+
+    按帧边界切：mp3 是帧流，从帧中间切会丢同步头，部分播放器报「文件损坏」。
+    本程序产出的 CBR 单声道 mp3 帧长固定，从帧头开始切每段都是合法 mp3。
+
+    原文件保留不动——用户明确要求「文件是在的」，切分只为能发出去，
+    不能动他的原始录音。分段写成同目录的 .part01.mp3 等，随时可删。
+
+    target_bytes 供测试用小样本验证（真实使用按 target_mb 走）。
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    target = target_bytes if target_bytes else target_mb * 1024 * 1024
+    if size <= target:
+        return []
+
+    # 跳过可能的 ID3 标签，找到第一个真帧头
+    start = 0
+    with open(path, "rb") as f:
+        head = f.read(min(4096, size))
+    for i in range(max(0, len(head) - 4)):
+        if _mp3_frame_len(head, i) > 0:
+            start = i
+            break
+
+    parts: list[Path] = []
+    with open(path, "rb") as src:
+        pos = start
+        idx = 0
+        while pos < size:
+            remain = size - pos
+            if remain <= target:
+                take = remain
+            else:
+                # 在目标位置附近向前回溯找帧边界。一帧 626 字节，回溯 4KB 足够。
+                src.seek(pos + target - 4096)
+                probe = src.read(4096 + 4)
+                base = pos + target - 4096
+                take = target
+                for back in range(min(4096, len(probe))):
+                    cand_abs = base + back
+                    if cand_abs <= pos:
+                        break
+                    if _mp3_frame_len(probe, back) > 0:
+                        take = cand_abs - pos
+                        break
+                if take <= 0:
+                    take = target
+            idx += 1
+            out = path.with_name(f"{path.stem}.part{idx:02d}{path.suffix}")
+            src.seek(pos)
+            written = 0
+            with open(out, "wb") as dst:
+                while written < take:
+                    buf = src.read(min(1 << 20, take - written))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    written += len(buf)
+            if written <= 0:
+                out.unlink(missing_ok=True)
+                break
+            parts.append(out)
+            log.info("切分 %s -> %s（%.1f MB）", path.name, out.name,
+                     written / 1024 / 1024)
+            pos += written
+    return parts
 
 
 class FeishuBot:
@@ -61,6 +200,11 @@ class FeishuBot:
         self._seen: set[str] = set()
         self._lock = threading.Lock()
         self._ws = None
+        # 上一段因超限没发出去的 mp3，供「切分」指令取用。
+        # 存最近一次即可：用户看到超限提示后立刻回复「切分」，
+        # 这种交互本来就紧邻发生，留历史队列反而会让「切分」切错文件。
+        self._oversize: Path | None = None
+        self._oversize_chat: str | None = None
 
     # ---------------- 发送 ----------------
     def send_text(self, chat_id: str, text: str) -> bool:
@@ -153,6 +297,11 @@ class FeishuBot:
 
     def _classify(self, text: str) -> str:
         t = text.lower()
+        # 切分要最先判：它只在大文件超限后使用，且「分割/分段」这类词
+        # 不该被「取消」「停止」的模糊匹配抢先命中。
+        # 用「切」单字兜住「切一下吧」「帮我切了」这类口语说法。
+        if any(w in t for w in SPLIT_WORDS) or ("切" in t and len(t) <= 12):
+            return "split"
         if any(w in t for w in CANCEL_WORDS):
             return "cancel"
         if any(w in t for w in STOP_WORDS):
@@ -223,6 +372,24 @@ class FeishuBot:
                 threading.Thread(
                     target=self._finish_and_push, args=(chat_id, rec, pre), daemon=True
                 ).start()
+            elif action == "split":
+                p, src_chat = self._oversize, self._oversize_chat
+                if not p or not p.exists():
+                    self.send_text(
+                        chat_id,
+                        "现在没有需要切分的文件。\n"
+                        "「切分」用于处理刚提示过超限的那段录音；"
+                        "其它时候直接发「录音」/「停止」即可。",
+                    )
+                    return
+                self.send_text(
+                    chat_id,
+                    f"✂️ 开始切分：{p.name}\n"
+                    f"按 {SPLIT_TARGET_MB}MB 一段，切好逐段发你。原文件不动。",
+                )
+                threading.Thread(
+                    target=self._split_and_push, args=(chat_id, p), daemon=True
+                ).start()
             elif action == "cancel":
                 r = self.svc.cmd_cancel()
                 self.send_text(chat_id, f"🗑 {r.get('msg')}")
@@ -280,8 +447,35 @@ class FeishuBot:
                 head += "\n\n⚠️ 全程峰值很低（{}），这段大概率没采到声音。".format(peak)
             self.send_text(chat_id, head)
             if mp3 and Path(mp3).exists():
-                ok = self.send_file(chat_id, Path(mp3))
-                if not ok:
+                p = Path(mp3)
+                try:
+                    size_mb = p.stat().st_size / 1024 / 1024
+                except OSError:
+                    size_mb = mb
+                # 飞书 im/v1/file/create 的硬上限是 30MB（官方文档「不超过 30 MB」）。
+                # 超限时整段必然传不上去，与其等接口报错再给一句笼统的「发送失败」，
+                # 不如提前把原因和可行范围讲清楚——文件本身完好，用户不用慌。
+                if size_mb > FEISHU_FILE_LIMIT_MB:
+                    # 按本次实际码率估算可发时长，不写死「半小时」这类数字：
+                    # 192kbps 只够 22 分钟，128kbps 才到 33 分钟，写死会误导。
+                    rate_mb_per_min = (mb / (recorded / 60)) if recorded > 0 else 0
+                    fit_min = (FEISHU_FILE_LIMIT_MB / rate_mb_per_min
+                               if rate_mb_per_min > 0 else 0)
+                    tip = (f"约 {fit_min:.0f} 分钟以内的录音可以正常发送"
+                           if fit_min > 0 else "较短的录音可以正常发送")
+                    # 记下这个文件，用户回「切分」时直接取用
+                    self._oversize = p
+                    self._oversize_chat = chat_id
+                    self.send_text(
+                        chat_id,
+                        f"⚠️ 文件太大，发不到飞书（这段 {size_mb:.0f} MB，"
+                        f"飞书限制 {FEISHU_FILE_LIMIT_MB} MB）。\n"
+                        f"录音本身完好，已保存在本机：\n{p}\n"
+                        f"{tip}，更长的话到电脑上取文件即可。\n\n"
+                        f"如果现在就要，回一句「切分」，我按 "
+                        f"{SPLIT_TARGET_MB}MB 一段切好发你（原文件不动）。",
+                    )
+                elif not self.send_file(chat_id, p):
                     self.send_text(chat_id, "⚠️ 文件发送失败，但已保存在本机会话目录。")
             else:
                 self.send_text(chat_id, "⚠️ 音频合成失败，分片已保留在会话目录。")
@@ -296,6 +490,48 @@ class FeishuBot:
         except Exception:
             log.exception("收尾推送异常")
             self.send_text(chat_id, "⚠️ 收尾推送异常，请查看服务日志")
+
+    def _split_and_push(self, chat_id: str, path: Path) -> None:
+        """把超限的 mp3 切段并逐段发送。
+
+        切分在后台线程做：300MB 的文件读一遍就要几秒，不能卡住长连接的事件线程。
+        每段发完立刻删掉该段文件——它们只是中转产物，留着白占磁盘。
+        原文件始终保留。
+        """
+        try:
+            parts = split_mp3(path)
+            if not parts:
+                self.send_text(chat_id, "⚠️ 切分没有产生分段，文件可能小于上限。")
+                return
+            total = len(parts)
+            self.send_text(chat_id, f"✂️ 切好了，共 {total} 段，开始发送…")
+            ok_n = 0
+            for i, part in enumerate(parts, 1):
+                try:
+                    size_mb = part.stat().st_size / 1024 / 1024
+                except OSError:
+                    size_mb = 0
+                if self.send_file(chat_id, part):
+                    ok_n += 1
+                else:
+                    self.send_text(
+                        chat_id,
+                        f"⚠️ 第 {i}/{total} 段发送失败（{part.name}，"
+                        f"{size_mb:.1f} MB），文件仍在本地。",
+                    )
+                # 发完即删：这些分段只是中转产物，原文件不动
+                try:
+                    part.unlink(missing_ok=True)
+                except Exception:
+                    log.warning("删除分段失败（被占用）：%s", part.name)
+            self.send_text(
+                chat_id,
+                f"✅ 切分发送完成：{ok_n}/{total} 段。\n"
+                f"原文件仍在：{path}",
+            )
+        except Exception:
+            log.exception("切分发送异常")
+            self.send_text(chat_id, "⚠️ 切分发送异常，请查看服务日志。")
 
     def _finalize_and_push(self, chat_id: str) -> None:
         try:

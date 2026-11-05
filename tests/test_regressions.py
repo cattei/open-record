@@ -433,6 +433,70 @@ def test_feishu_warn_ack_resets_on_edit():
     check("凭据变了就重置确认", "_warn_ack = False" in block,
           "未重置 _warn_ack")
 
+def test_mp3_split_frame_aligned():
+    """大 mp3 切分必须落在帧边界，每段能独立播放。
+
+    背景：飞书 im/v1/file/create 硬上限 30MB，3 小时 50 分的录音有 316MB，
+    整段必然发不出去。用户回「切分」时按 28MB 一段切开逐段发送。
+    切分的关键是**对齐 MPEG 帧边界**——从帧中间切会丢同步头，
+    播放器报「文件损坏」。这里用真实 lameenc 输出验证：
+
+      1. 切出的段数、大小符合预期（每段 <= 上限）
+      2. 每段首字节都是合法的 MPEG1 L3 帧头
+      3. 所有段时长之和约等于原文件（不丢音频）
+      4. **原文件必须还在**（用户明确要求文件不能动）
+    """
+    print("\\n[P2] 大 mp3 按帧边界切分")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("feishu_split", APP / "feishu.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    import lameenc
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # 造一段 3 秒 16k 单声道 mp3，再用小 target 强制切分
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(192)
+        enc.set_in_sample_rate(16000)
+        enc.set_channels(1)
+        enc.set_quality(2)
+        n = 16000 * 3
+        pcm = np.zeros(n, dtype=np.int16).tobytes()
+        data = enc.encode(pcm) + enc.flush()
+        src = tmp / "orig.mp3"
+        src.write_bytes(data)
+        orig_size = src.stat().st_size
+
+        # 直接给字节数，绕开 MB 粒度（3 秒 mp3 只有 61KB，按 MB 切不动）
+        target_bytes = orig_size // 3
+        parts = mod.split_mp3(src, target_mb=1, target_bytes=target_bytes)
+
+        check("产生了分段", len(parts) >= 2, f"段数={len(parts)}")
+        check("原文件仍在", src.exists() and src.stat().st_size == orig_size,
+              f"原文件={src.stat().st_size if src.exists() else '缺失'}")
+
+        limit = target_bytes
+        too_big = [q.name for q in parts if q.stat().st_size > limit]
+        check("每段不超过目标", not too_big, f"超限={too_big}")
+
+        # 每段开头必须是合法帧头
+        bad_head = []
+        for q in parts:
+            head = q.read_bytes()[:8]
+            if mod._mp3_frame_len(head, 0) <= 0:
+                bad_head.append(q.name)
+        check("每段都以帧头开始", not bad_head, f"坏头={bad_head}")
+
+        # 字节总量应等于原文件（按帧边界切，不漏不多）
+        total = sum(q.stat().st_size for q in parts)
+        check("分段字节总和等于原文件", total == orig_size,
+              f"{total} vs {orig_size}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_feishu_bot_ctor_order():
     """GUI 启动飞书时的参数顺序必须是 (app_id, app_secret, service)。
 
@@ -497,6 +561,7 @@ def main():
     test_finish_session_lock()
     test_writer_reuse()
     test_feishu_bot_ctor_order()
+    test_mp3_split_frame_aligned()
     test_feishu_warn_ack_resets_on_edit()
     test_feishu_prebuffer_field()
 

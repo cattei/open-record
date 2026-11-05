@@ -27,3 +27,9 @@ desktop.ini
 
 # 临时诊断截图（验证用，不入库）
 _diag_*.png
+_*.txt
+
+# 开发期的临时实验产物（与本项目无关，体积大）
+.tmp-chrome-test/
+plugins/
+promo/dsh-product-kit/
