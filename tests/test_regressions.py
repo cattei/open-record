@@ -433,6 +433,29 @@ def test_feishu_warn_ack_resets_on_edit():
     check("凭据变了就重置确认", "_warn_ack = False" in block,
           "未重置 _warn_ack")
 
+def test_feishu_silences_noise_events():
+    """飞书推送的无关事件必须注册空处理器，否则日志被 ERROR 刷屏。
+
+    真实事故：日志里反复出现
+      [ERROR] handle message failed, err: processor not found,
+              type: im.message.message_read_v1
+      [ERROR] ... type: im.chat.access_event.bot_p2p_chat_entered_v1
+    看着像故障，其实只是没注册处理器。这类噪音会淹没真错误，
+    导致排查时误判（上次飞书连不上，就是被一堆无害 ERROR 干扰了判断）。
+
+    断言：这两个事件类型都必须注册了处理器。
+    """
+    print("\\n[P2] 飞书无关事件需静默")
+    src = (APP / "feishu.py").read_text(encoding="utf-8")
+
+    needed = (
+        "register_p2_im_message_message_read_v1",
+        "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
+    )
+    missing = [n for n in needed if n not in src]
+    check("已注册全部噪音事件处理器", not missing, f"缺少={missing}")
+
+
 def test_mp3_split_frame_aligned():
     """大 mp3 切分必须落在帧边界，每段能独立播放。
 
@@ -562,6 +585,7 @@ def main():
     test_writer_reuse()
     test_feishu_bot_ctor_order()
     test_mp3_split_frame_aligned()
+    test_feishu_silences_noise_events()
     test_feishu_warn_ack_resets_on_edit()
     test_feishu_prebuffer_field()
 
