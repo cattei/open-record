@@ -433,6 +433,36 @@ def test_feishu_warn_ack_resets_on_edit():
     check("凭据变了就重置确认", "_warn_ack = False" in block,
           "未重置 _warn_ack")
 
+def test_gui_has_exit_trail():
+    """pythonw 无控制台，进程死亡必须留痕，否则无法排查。
+
+    真实事故：服务在某次正常收尾后消失，机器没重启、无 WER 崩溃记录、
+    日志戛然而止。原因是 pythonw.exe 没有控制台，未捕获异常不打印到
+    任何地方；而 _shutdown / request_quit 也一行日志都不写。
+    结果「进程怎么死的」永远查不到。
+
+    断言：
+      1. main() 里装了 sys.excepthook 与 threading.excepthook
+      2. _shutdown / request_quit 有日志输出
+    """
+    print("\\n[P2] 进程退出必须留痕")
+    src = (APP / "gui.py").read_text(encoding="utf-8")
+
+    check("装了 sys.excepthook", "sys.excepthook =" in src,
+          "未安装主线程异常钩子")
+    check("装了 threading.excepthook", "threading.excepthook =" in src,
+          "未安装线程异常钩子")
+
+    i = src.find("def _shutdown(self)")
+    j = src.find("class FeishuSetupDialog")
+    shut = src[i:j]
+    check("_shutdown 写日志", "log.info" in shut, "关闭过程无日志")
+
+    k = src.find("def request_quit(self)")
+    quit_blk = src[k:i]
+    check("request_quit 写日志", "log.info" in quit_blk, "退出请求无日志")
+
+
 def test_feishu_silences_noise_events():
     """飞书推送的无关事件必须注册空处理器，否则日志被 ERROR 刷屏。
 
@@ -586,6 +616,7 @@ def main():
     test_feishu_bot_ctor_order()
     test_mp3_split_frame_aligned()
     test_feishu_silences_noise_events()
+    test_gui_has_exit_trail()
     test_feishu_warn_ack_resets_on_edit()
     test_feishu_prebuffer_field()
 

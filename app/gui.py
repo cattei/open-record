@@ -836,6 +836,7 @@ class RecWindow(QMainWindow):
                          "已收进右下角托盘。单击图标可重新打开，右键可退出。")
 
     def request_quit(self):
+        log.info("收到退出请求（托盘右键 → 退出）录音中=%s", self._recording)
         if self._recording:
             r = QMessageBox.question(
                 self, "正在录音", "当前正在录音，退出会丢弃本次录音。确定退出？",
@@ -853,6 +854,7 @@ class RecWindow(QMainWindow):
         QApplication.instance().quit()
 
     def _shutdown(self):
+        log.info("开始关闭：停计时器、停 HTTP、停录音服务")
         # 先置 _dead，再停服务：后台线程可能正好在收尾时 emit
         self._dead = True
         self.timer.stop()
@@ -861,7 +863,8 @@ class RecWindow(QMainWindow):
             try:
                 self.svc.stop_all()
             except Exception:
-                pass
+                log.exception("关闭时停止服务出错")
+        log.info("关闭完成")
 
 
 class FeishuSetupDialog(QDialog):
@@ -1052,6 +1055,24 @@ def main(argv: list[str] | None = None) -> int:
         start_hidden = False
 
     setup_logging()
+
+    # pythonw.exe 没有控制台：未捕获异常不会打印到任何地方，进程直接静默消失。
+    # 真实事故：服务在某次正常收尾后「人间蒸发」，机器没重启、无 WER 崩溃记录、
+    # 日志戛然而止，完全无法判断死因。装上钩子后，主线程和后台线程的未捕获
+    # 异常都会写进日志，下次再死至少能知道死在哪。
+    def _excepthook(exc_type, exc, tb):
+        log.critical("主线程未捕获异常，进程即将退出", exc_info=(exc_type, exc, tb))
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+
+    def _thread_excepthook(args):
+        log.critical("线程 %s 未捕获异常", args.thread.name if args.thread else "?",
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
 
     # ---- 单实例：先抢锁 ----
     # 抢不到说明已有实例在跑。此时把「显示窗口」指令送过去，自己退出。
