@@ -226,6 +226,11 @@ class FeishuBot:
             if not resp.success():
                 log.error("发送失败 code=%s msg=%s", resp.code, resp.msg)
                 return False
+            # 成功也留痕：原来只记失败，导致「收尾后到底发了什么、发没发成功」
+            # 在日志里完全查不到（真实事故：19:41 收尾完成后日志一片空白，
+            # 无法判断是发送失败还是根本没走到发送）。
+            log.info("已发文本 chat=%s len=%d 摘要=%r",
+                     chat_id[-6:], len(text), text[:40].replace("\n", " "))
             return True
         except Exception:
             log.exception("发送消息异常")
@@ -284,6 +289,11 @@ class FeishuBot:
             if not mresp.success():
                 log.error("发送文件消息失败 code=%s msg=%s", mresp.code, mresp.msg)
                 return False
+            try:
+                mb = path.stat().st_size / 1024 / 1024
+            except OSError:
+                mb = 0
+            log.info("已发文件 chat=%s %s（%.1f MB）", chat_id[-6:], path.name, mb)
             return True
         except Exception:
             log.exception("发送文件异常")

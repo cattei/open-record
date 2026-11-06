@@ -433,6 +433,31 @@ def test_feishu_warn_ack_resets_on_edit():
     check("凭据变了就重置确认", "_warn_ack = False" in block,
           "未重置 _warn_ack")
 
+def test_feishu_send_logs_success():
+    """发送成功也必须留痕，不能只记失败。
+
+    真实事故：19:38 收到「停止」、19:41 收尾完成生成 213.5MB mp3，
+    之后日志一片空白——既没有发送成功的记录，也没有发送失败的错误。
+    无法判断「文件到底发没发出去」，只能靠猜。
+
+    根因：send_text / send_file 只在失败时 log.error，成功时直接 return True。
+    断言这两处成功分支都有 log.info。
+    """
+    print("\\n[P2] 飞书发送成功需留痕")
+    src = (APP / "feishu.py").read_text(encoding="utf-8")
+
+    for fn, marker in (("def send_text", "已发文本"),
+                       ("def send_file", "已发文件")):
+        i = src.find(fn)
+        check(fn + " 存在", i > 0, "未找到")
+        if i <= 0:
+            continue
+        # 取到下一个 def 为止
+        nxt = src.find("\n    def ", i + 1)
+        blk = src[i:nxt if nxt > 0 else len(src)]
+        check(fn + " 成功分支写日志", marker in blk,
+              f"成功时无日志（应含「{marker}」）")
+
 def test_gui_has_exit_trail():
     """pythonw 无控制台，进程死亡必须留痕，否则无法排查。
 
@@ -617,6 +642,7 @@ def main():
     test_mp3_split_frame_aligned()
     test_feishu_silences_noise_events()
     test_gui_has_exit_trail()
+    test_feishu_send_logs_success()
     test_feishu_warn_ack_resets_on_edit()
     test_feishu_prebuffer_field()
 
