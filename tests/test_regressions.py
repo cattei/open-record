@@ -511,6 +511,121 @@ def test_feishu_silences_noise_events():
     check("已注册全部噪音事件处理器", not missing, f"缺少={missing}")
 
 
+def test_guardian_uses_lock_port():
+    """守护必须用单实例锁端口判活，不能靠数进程。
+
+    为什么这条重要：机器上可能有别的 pythonw 在跑，数进程会误判成
+    「已经在跑」而放弃拉起——正是那次事故的失败模式（看着在跑其实没在）。
+    锁端口只有真正在服务的实例才占用，是权威信号。
+
+    同时验证拉起时用的是 autostart 的 pythonw + launcher，
+    而不是写死路径（换机器/换目录就失效）。
+    """
+    print("\\n[P2] 守护判活方式")
+    src = (APP / "guardian.py").read_text(encoding="utf-8")
+
+    check("用 singleton.LOCK_PORT 判活", "singleton.LOCK_PORT" in src,
+          "未使用锁端口")
+    check("不靠数进程判活", "tasklist" not in src.lower(),
+          "仍用 tasklist 数进程（会误判）")
+    check("拉起走 autostart.pythonw", "autostart.pythonw()" in src,
+          "路径可能写死")
+    check("拉起带 --background", "autostart.FLAG" in src,
+          "未使用 autostart.FLAG")
+
+    # 语法可导入（不执行安装动作）
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guardian_mod", APP / "guardian.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    check("可导入且暴露 is_running", hasattr(mod, "is_running"), "缺少 is_running")
+    check("可导入且暴露 check_and_heal", hasattr(mod, "check_and_heal"), "缺少 check_and_heal")
+
+    # 用户主动退出后不能被强行拉起，否则「右键退出」这个功能就是假的
+    check("退出标记机制存在", "def mark_user_quit" in src and "def user_quit" in src,
+          "缺少用户退出标记")
+    i = src.find("def check_and_heal")
+    j = src.find("def _ps")
+    heal = src[i:j]
+    check("守护尊重用户退出", "user_quit()" in heal,
+          "check_and_heal 未检查退出标记")
+    gui_src = (APP / "gui.py").read_text(encoding="utf-8")
+    check("退出时写标记", "mark_user_quit()" in gui_src, "request_quit 未写标记")
+    check("启动时清标记", "clear_user_quit()" in gui_src, "启动未清标记")
+
+
+def test_merge_segments_by_duration():
+    """超长录音要按时长切成多个 mp3，且不丢音频。
+
+    需求：3 小时 50 分合成一个 316MB 文件不好用——定位某一段只能拖进度条，
+    分享也麻烦。改成每段约 N 分钟。
+
+    验证：
+      1. 总时长超过阈值时确实产出多个文件，文件名带 partNN
+      2. 各段时长之和等于总时长（不丢音频）
+      3. 每段都不超过「阈值 + 一个分片」的误差
+      4. 低于阈值时仍是单文件（不无谓拆分）
+      5. 分片被正确删除
+    """
+    print("\\n[P2] 按时长分段合并")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_seg", APP / "merge.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        def make_session(n_chunks, chunk_sec):
+            d = Path(tempfile.mkdtemp(dir=tmp))
+            sr = 16000
+            for i in range(1, n_chunks + 1):
+                p = d / f"chunk_{i:05d}.wav"
+                with wave.open(str(p), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(sr)
+                    # 造一点有内容的信号，避免全静音被判定跳过
+                    n = int(sr * chunk_sec)
+                    t = np.arange(n, dtype=np.float32) / sr
+                    sig = (np.sin(2 * np.pi * 440 * t) * 3000).astype(np.int16)
+                    w.writeframes(sig.tobytes())
+            return d
+
+        # 情形一：10 个 30 秒分片 = 5 分钟，阈值 2 分钟 -> 应切成 3 段
+        d1 = make_session(10, 30.0)
+        r1 = mod.merge_session(d1, segment_minutes=2, delete_chunks=True)
+        check("超阈值时切分", r1 is not None and len(r1["segments"]) >= 2,
+              f"段数={len(r1['segments']) if r1 else 'None'}")
+        if r1:
+            names = [Path(x["mp3"]).name for x in r1["segments"]]
+            check("分段文件名带 part", all(".part" in n for n in names), str(names))
+            tot = sum(x["seconds"] for x in r1["segments"])
+            check("各段时长之和等于总时长", abs(tot - 300.0) < 1.5,
+                  f"{tot:.1f}s vs 300s")
+            over = [n for n, x in zip(names, r1["segments"])
+                    if x["seconds"] > 2 * 60 + 31]   # 阈值 + 一个分片
+            check("每段不超阈值+一片", not over, f"超长={over}")
+            left = list(d1.glob("chunk_*.wav"))
+            check("分片已删除", not left, f"残留 {len(left)} 个")
+
+        # 情形二：5 分钟 < 阈值 10 分钟 -> 单文件
+        d2 = make_session(10, 30.0)
+        r2 = mod.merge_session(d2, segment_minutes=10, delete_chunks=True)
+        check("未超阈值时不切", r2 is not None and len(r2["segments"]) == 1,
+              f"段数={len(r2['segments']) if r2 else 'None'}")
+        if r2:
+            nm = Path(r2["segments"][0]["mp3"]).name
+            check("单文件不带 part", ".part" not in nm, nm)
+
+        # 情形三：segment_minutes=0 -> 旧行为，单文件
+        d3 = make_session(10, 30.0)
+        r3 = mod.merge_session(d3, segment_minutes=0, delete_chunks=True)
+        check("0 表示不切分", r3 is not None and len(r3["segments"]) == 1,
+              f"段数={len(r3['segments']) if r3 else 'None'}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_mp3_split_frame_aligned():
     """大 mp3 切分必须落在帧边界，每段能独立播放。
 
@@ -639,6 +754,8 @@ def main():
     test_finish_session_lock()
     test_writer_reuse()
     test_feishu_bot_ctor_order()
+    test_guardian_uses_lock_port()
+    test_merge_segments_by_duration()
     test_mp3_split_frame_aligned()
     test_feishu_silences_noise_events()
     test_gui_has_exit_trail()

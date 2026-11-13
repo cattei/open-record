@@ -267,11 +267,14 @@ class RecService:
             fname = f"{t.session_id}-{end_ts}.mp3" if end_ts else None
             m = merge_session(t.dir, bitrate=self.cfg.get("mp3_bitrate", 192),
                               delete_chunks=True, filename=fname,
-                              max_gain=float(self.cfg.get("gain", 12.0)))
+                              max_gain=float(self.cfg.get("gain", 12.0)),
+                              segment_minutes=float(self.cfg.get("segment_minutes", 0) or 0))
             if m:
                 result["audio_mp3"] = m["mp3"]
                 result["audio_bytes"] = m["bytes"]
                 result["duration_sec"] = m["seconds"]
+                # 分段列表：单段时只有一项。飞书/界面按它逐个发送或展示。
+                result["audio_segments"] = m.get("segments") or []
                 result["recorded_sec"] = round(max(0.0, m["seconds"] - result["prebuffer_sec"]), 1)
         except Exception:
             log.exception("合并 mp3 失败，保留原分片")
@@ -387,10 +390,12 @@ class RecService:
                 from merge import merge_session
                 m = merge_session(t.dir, bitrate=self.cfg.get("mp3_bitrate", 192),
                                   delete_chunks=True,
-                                  max_gain=float(self.cfg.get("gain", 12.0)))
+                                  max_gain=float(self.cfg.get("gain", 12.0)),
+                                  segment_minutes=float(self.cfg.get("segment_minutes", 0) or 0))
                 if m:
                     result["audio_mp3"] = m["mp3"]
                     result["audio_bytes"] = m["bytes"]
+                    result["audio_segments"] = m.get("segments") or []
                     result["chunks_removed"] = m["chunks_removed"]
                     (t.dir / "result.json").write_text(
                         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"

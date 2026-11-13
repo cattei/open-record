@@ -33,3 +33,6 @@ _*.txt
 .tmp-chrome-test/
 plugins/
 promo/dsh-product-kit/
+
+# 用户主动退出的标记（守护任务据此跳过拉起）
+.user_quit

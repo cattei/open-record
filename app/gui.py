@@ -759,6 +759,10 @@ class RecWindow(QMainWindow):
         self.chk_autostart.setChecked(bool(ok))
         self.chk_autostart.blockSignals(False)
 
+        # 自启只管「开机时启动一次」。进程中途死掉时靠守护任务每 5 分钟
+        # 把它拉回来——否则会像那次事故一样：看着在跑，其实十几个小时没在跑。
+        self._sync_guardian(bool(ok))
+
         if first_run and ok:
             self.tray.notify("已设为开机自启",
                              "录音助手会随系统启动并常驻右下角，右键图标可退出。")
@@ -768,9 +772,31 @@ class RecWindow(QMainWindow):
         else:
             log.info("开机自启已就绪：%s", cmd)
 
+    def _sync_guardian(self, want: bool) -> None:
+        """让守护计划任务跟随「开机自启」开关。
+
+        守护任务注册/注销要调 PowerShell，耗时约 1-3 秒，所以放后台线程，
+        不卡界面。失败只记日志，不打扰用户——自启本身仍然是生效的。
+        """
+        def work():
+            try:
+                import guardian
+                st = guardian.status()
+                if want and not st.get("installed"):
+                    ok, msg = guardian.install()
+                    log.info("守护任务安装：%s %s", ok, msg[:120])
+                elif not want and st.get("installed"):
+                    ok, msg = guardian.uninstall()
+                    log.info("守护任务卸载：%s %s", ok, msg[:120])
+            except Exception:
+                log.exception("同步守护任务失败")
+
+        threading.Thread(target=work, name="guardian-sync", daemon=True).start()
+
     def _apply_autostart(self, want: bool, quiet: bool = False) -> bool:
         ok, cmd = autostart.sync(want)
         self.tray.set_autostart(want if ok else autostart.is_enabled())
+        self._sync_guardian(bool(ok and want))
         if not quiet:
             if ok:
                 self.log_signal.emit("已开启开机自启" if want else "已关闭开机自启")
@@ -848,6 +874,13 @@ class RecWindow(QMainWindow):
                 self.svc.cmd_cancel()
             except Exception:
                 pass
+        # 标记「用户主动退出」：否则守护任务 5 分钟内又会把它拉起来，
+        # 等于把用户的明确意图推翻。开机或手动双击 bat 时会清掉这个标记。
+        try:
+            import guardian
+            guardian.mark_user_quit()
+        except Exception:
+            log.exception("写退出标记失败（守护可能仍会拉起）")
         self._really_quit = True
         self._shutdown()
         self.tray.hide()
@@ -1073,6 +1106,16 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.excepthook = _excepthook
     threading.excepthook = _thread_excepthook
+
+    # 本次是正常启动（开机自启或用户手动双击），清掉上次「用户主动退出」的
+    # 标记，让守护任务重新恢复看护职责。
+    try:
+        import guardian
+        if guardian.user_quit():
+            guardian.clear_user_quit()
+            log.info("已清除上次的用户退出标记，守护恢复看护")
+    except Exception:
+        log.exception("清除退出标记失败")
 
     # ---- 单实例：先抢锁 ----
     # 抢不到说明已有实例在跑。此时把「显示窗口」指令送过去，自己退出。

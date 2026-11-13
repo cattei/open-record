@@ -89,7 +89,30 @@ def merge_session(session_dir: Path, bitrate: int = BITRATE,
                   delete_chunks: bool = True, filename: str | None = None,
                   normalize: bool = True, target_peak: float = 0.18,
                   max_gain: float = 12.0, floor_peak: float = 0.0015,
-                  highpass_hz: float = 0.0) -> dict | None:
+                  highpass_hz: float = 0.0,
+                  segment_minutes: float = 0) -> dict | None:
+    """把分片合并成 mp3。
+
+    segment_minutes > 0 时**按该时长切成多个文件**（每段约 N 分钟）。
+    为什么默认要切（config 里 segment_minutes=60）：
+
+      · 3 小时 50 分合成一个 316MB 文件，想找「下午三点那段」只能拖进度条；
+        按小时切好，文件名自带起止时间，直接跳到对应文件。
+      · 飞书单文件上限 30MB，一整段 300MB 只能靠「切分」指令二次加工；
+        按时长分好之后，定位和分发都容易得多。
+      · 单个文件损坏（断电、磁盘满）只丢一段，而不是整场录音全没了。
+      · 转写/剪辑工具对大文件的处理普遍更慢更吃内存，分段更友好。
+
+    为什么取 1 小时而不是别的：
+      · 30 分钟段数太多，5 小时录音会拆成 10 个文件，翻起来烦；
+      · 2 小时又接近旧行为的痛点（单文件过大、定位难）；
+      · 1 小时是「一场会 / 一段工作」的自然粒度，与常见会议、课程、
+        访谈的时长也对得上。
+      需要别的粒度改 config.json 的 segment_minutes 即可（0=不切）。
+
+    切分点落在分片边界上（默认 30 秒一片），所以每段时长是 N 分钟
+    ± chunk_sec 的误差，绝不会切断某个分片内部的音频。
+    """
     session_dir = Path(session_dir)
     chunks = sorted(session_dir.glob("chunk_*.wav"),
                     key=lambda p: int(p.stem.split("_")[1]))
@@ -123,53 +146,99 @@ def merge_session(session_dir: Path, bitrate: int = BITRATE,
     log.info("电平：原始峰值 %.1f dBFS，增益 %.1fx (+%.1f dB)，高通 %.0fHz",
              20 * np.log10(max(orig_peak, 1e-9)), gain, gain_db, highpass_hz)
 
-    enc = lameenc.Encoder()
-    enc.set_bit_rate(bitrate)
-    enc.set_in_sample_rate(rate)
-    enc.set_channels(1)
-    enc.set_quality(2)
+    # 高通滤波需要 scipy。默认 highpass_hz=0 即关闭，
+    # 此时不导入 scipy（分发包有意排除它，体积省约 100MB）。
+    sos = None
+    if highpass_hz > 0:
+        try:
+            from scipy.signal import butter, sosfilt, sosfilt_zi
+            sos = butter(2, highpass_hz, btype="high", fs=rate, output="sos")
+        except ImportError:
+            log.warning("未安装 scipy，跳过高通滤波（不影响录音）")
+            highpass_hz = 0
 
-    out = session_dir / (filename or "audio.mp3")
+    # 先读每个分片的时长（只读 WAV 头，不解码音频），用来决定在哪切段
+    chunk_secs: list[float] = []
+    for c in chunks:
+        try:
+            with wave.open(str(c), "rb") as w:
+                chunk_secs.append(w.getnframes() / float(w.getframerate() or rate))
+        except Exception:
+            chunk_secs.append(0.0)
+
+    seg_limit = float(segment_minutes) * 60.0 if segment_minutes else 0.0
+    total_sec = sum(chunk_secs)
+    if seg_limit <= 0 or total_sec <= seg_limit * 1.05:
+        # 不切分；或只超一点点——不值得为几秒多切出一个文件
+        plan = [(0, len(chunks))]
+    else:
+        plan = []
+        start = 0
+        acc = 0.0
+        for i, s in enumerate(chunk_secs):
+            # 到点就切，但保证每片至少含一个分片，避免出现空段
+            if acc >= seg_limit and i > start:
+                plan.append((start, i))
+                start = i
+                acc = 0.0
+            acc += s
+        if start < len(chunks):
+            plan.append((start, len(chunks)))
+        log.info("按时长切分：%.1f 分钟 -> %d 段（每段约 %.0f 分钟）",
+                 total_sec / 60, len(plan), segment_minutes)
+
+    # 文件名去掉 .mp3 后缀，多段时按 part01 追加
+    stem = filename or "audio.mp3"
+    if stem.lower().endswith(".mp3"):
+        stem = stem[:-4]
+
+    outputs: list[dict] = []
     total = 0.0
     frames = 0
     try:
-        with open(out, "wb") as f:
-            # 高通滤波需要 scipy。默认 highpass_hz=0 即关闭，
-            # 此时不导入 scipy（分发包有意排除它，体积省约 100MB）。
-            sos = None
+        for idx, (a, b) in enumerate(plan, 1):
+            out = (session_dir / f"{stem}.mp3" if len(plan) == 1
+                   else session_dir / f"{stem}.part{idx:02d}.mp3")
+            enc = lameenc.Encoder()
+            enc.set_bit_rate(bitrate)
+            enc.set_in_sample_rate(rate)
+            enc.set_channels(1)
+            enc.set_quality(2)
+            seg_sec = 0.0
+            # 每段都重置滤波器状态：跨文件沿用 zi 会让下一段开头
+            # 带着上一段末尾的滤波器记忆，产生可听见的起振噪声。
             zi = None
-            if highpass_hz > 0:
-                try:
-                    from scipy.signal import butter, sosfilt, sosfilt_zi
-                    sos = butter(2, highpass_hz, btype="high", fs=rate, output="sos")
-                except ImportError:
-                    log.warning("未安装 scipy，跳过高通滤波（不影响录音）")
-                    highpass_hz = 0
-            for c in chunks:
-                pcm, sec = _read_chunk_pcm(c, target_sr=None)
-                if pcm:
-                    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-                    # 高通滤波：切掉低频轰鸣（实测 0-300Hz 占总能量 47%，是"糊"的主因）
-                    if sos is not None:
-                        if zi is None:
-                            zi = sosfilt_zi(sos) * arr[0]
-                        arr, zi = sosfilt(sos, arr, zi=zi)
-                    if gain != 1.0:
-                        arr = arr * gain
-                    pcm = np.clip(arr, -32768, 32767).astype(np.int16).tobytes()
-                total += sec
-                frames += len(pcm) // 2
-                f.write(enc.encode(pcm))
-            f.write(enc.flush())
+            with open(out, "wb") as f:
+                for c in chunks[a:b]:
+                    pcm, sec = _read_chunk_pcm(c, target_sr=None)
+                    if pcm:
+                        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                        # 高通滤波：切掉低频轰鸣（实测 0-300Hz 占总能量 47%，是"糊"的主因）
+                        if sos is not None:
+                            if zi is None:
+                                zi = sosfilt_zi(sos) * arr[0]
+                            arr, zi = sosfilt(sos, arr, zi=zi)
+                        if gain != 1.0:
+                            arr = arr * gain
+                        pcm = np.clip(arr, -32768, 32767).astype(np.int16).tobytes()
+                    seg_sec += sec
+                    frames += len(pcm) // 2
+                    f.write(enc.encode(pcm))
+                f.write(enc.flush())
+            size = out.stat().st_size if out.exists() else 0
+            total += seg_sec
+            outputs.append({"mp3": str(out), "bytes": size,
+                            "seconds": round(seg_sec, 2)})
+            log.info("合并完成 %s：%.1f 秒，%.1f MB，%dHz %dkbps",
+                     out.name, seg_sec, size / 1024 / 1024, rate, bitrate)
     except Exception:
         log.exception("合并失败，保留原分片")
-        if out.exists():
-            out.unlink(missing_ok=True)
+        for o in outputs:              # 只清理本次已产出的半成品
+            Path(o["mp3"]).unlink(missing_ok=True)
         return None
 
-    size = out.stat().st_size if out.exists() else 0
-    log.info("合并完成 %s：%.1f 秒，%.1f MB，%dHz %dkbps",
-             out.name, total, size / 1024 / 1024, bitrate)
+    out = Path(outputs[0]["mp3"])
+    size = outputs[0]["bytes"]
 
     if delete_chunks:
         removed = 0
@@ -197,6 +266,11 @@ def merge_session(session_dir: Path, bitrate: int = BITRATE,
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             meta["audio_mp3"] = out.name
             meta["audio_mp3_bytes"] = size
+            # 分段信息：单段时 segments 只有一项，播放器/界面仍按列表读
+            meta["segments"] = [{"file": Path(o["mp3"]).name,
+                                 "bytes": o["bytes"],
+                                 "seconds": o["seconds"]} for o in outputs]
+            meta["segment_minutes"] = segment_minutes
             meta["chunks_removed"] = bool(delete_chunks)
             meta["merged_sec"] = round(total, 2)
             meta["original_peak_dbfs"] = round(20 * np.log10(max(orig_peak, 1e-9)), 1)
@@ -207,6 +281,7 @@ def merge_session(session_dir: Path, bitrate: int = BITRATE,
             log.warning("更新 session.json 失败")
 
     return {"mp3": str(out), "seconds": round(total, 2), "bytes": size,
+            "segments": outputs,
             "chars_frames": frames, "chunks_removed": len(chunks) if delete_chunks else 0,
             "original_peak_dbfs": round(20 * np.log10(max(orig_peak, 1e-9)), 1),
             "applied_gain": round(gain, 2), "applied_gain_db": round(gain_db, 1)}

@@ -203,7 +203,9 @@ class FeishuBot:
         # 上一段因超限没发出去的 mp3，供「切分」指令取用。
         # 存最近一次即可：用户看到超限提示后立刻回复「切分」，
         # 这种交互本来就紧邻发生，留历史队列反而会让「切分」切错文件。
-        self._oversize: Path | None = None
+        # 待切分的文件列表（可能多段超限）。存最近一次即可：用户看到提示后
+        # 立刻回「切分」，这种交互紧邻发生，留历史队列反而会切错文件。
+        self._oversize: list[Path] = []
         self._oversize_chat: str | None = None
 
     # ---------------- 发送 ----------------
@@ -383,8 +385,8 @@ class FeishuBot:
                     target=self._finish_and_push, args=(chat_id, rec, pre), daemon=True
                 ).start()
             elif action == "split":
-                p, src_chat = self._oversize, self._oversize_chat
-                if not p or not p.exists():
+                pending = [q for q in (self._oversize or []) if q.exists()]
+                if not pending:
                     self.send_text(
                         chat_id,
                         "现在没有需要切分的文件。\n"
@@ -392,13 +394,14 @@ class FeishuBot:
                         "其它时候直接发「录音」/「停止」即可。",
                     )
                     return
+                names = "\n".join(f"· {q.name}" for q in pending)
                 self.send_text(
                     chat_id,
-                    f"✂️ 开始切分：{p.name}\n"
+                    f"✂️ 开始切分 {len(pending)} 个文件：\n{names}\n"
                     f"按 {SPLIT_TARGET_MB}MB 一段，切好逐段发你。原文件不动。",
                 )
                 threading.Thread(
-                    target=self._split_and_push, args=(chat_id, p), daemon=True
+                    target=self._split_and_push, args=(chat_id, pending), daemon=True
                 ).start()
             elif action == "cancel":
                 r = self.svc.cmd_cancel()
@@ -455,6 +458,39 @@ class FeishuBot:
                     f"文件大小：{mb:.1f} MB")
             if peak < 200:
                 head += "\n\n⚠️ 全程峰值很低（{}），这段大概率没采到声音。".format(peak)
+            # 按时长切分后会有多个文件。逐个发，并在开头说明共有几段、
+            # 每段对应哪一段时间，方便用户直接跳到想看的那段。
+            segs = [Path(s["mp3"]) for s in (res.get("audio_segments") or [])
+                    if s.get("mp3") and Path(s["mp3"]).exists()]
+            if len(segs) > 1:
+                total_mb = sum(s.stat().st_size for s in segs) / 1024 / 1024
+                head += f"\n已按每段约 1 小时切分，共 {len(segs)} 个文件（合计 {total_mb:.0f} MB）"
+                self.send_text(chat_id, head)
+                sent = 0
+                oversize: list[Path] = []
+                for i, sp in enumerate(segs, 1):
+                    smb = sp.stat().st_size / 1024 / 1024
+                    if smb > FEISHU_FILE_LIMIT_MB:
+                        # 单段仍超限（码率高或配置里把分段调长了）：
+                        # 记下来让用户回「切分」，不要在这里静默失败。
+                        oversize.append(sp)
+                        continue
+                    if self.send_file(chat_id, sp):
+                        sent += 1
+                if oversize:
+                    self._oversize = list(oversize)
+                    self._oversize_chat = chat_id
+                    names = "\n".join(f"· {p.name}" for p in oversize)
+                    self.send_text(
+                        chat_id,
+                        f"⚠️ 有 {len(oversize)} 段超过飞书 "
+                        f"{FEISHU_FILE_LIMIT_MB} MB 限制，未能发送：\n{names}\n"
+                        f"回一句「切分」，我把它们再切细后发你。\n"
+                        f"文件都在本机：{segs[0].parent}",
+                    )
+                if sent:
+                    log.info("分段发送完成 %d/%d 段", sent, len(segs))
+                return
             self.send_text(chat_id, head)
             if mp3 and Path(mp3).exists():
                 p = Path(mp3)
@@ -474,7 +510,7 @@ class FeishuBot:
                     tip = (f"约 {fit_min:.0f} 分钟以内的录音可以正常发送"
                            if fit_min > 0 else "较短的录音可以正常发送")
                     # 记下这个文件，用户回「切分」时直接取用
-                    self._oversize = p
+                    self._oversize = [p]
                     self._oversize_chat = chat_id
                     self.send_text(
                         chat_id,
@@ -501,15 +537,20 @@ class FeishuBot:
             log.exception("收尾推送异常")
             self.send_text(chat_id, "⚠️ 收尾推送异常，请查看服务日志")
 
-    def _split_and_push(self, chat_id: str, path: Path) -> None:
+    def _split_and_push(self, chat_id: str, paths) -> None:
         """把超限的 mp3 切段并逐段发送。
 
-        切分在后台线程做：300MB 的文件读一遍就要几秒，不能卡住长连接的事件线程。
+        paths 可以是单个 Path，也可以是多个（按时长分段后有多段超限时）。
+        切分在后台线程做：300MB 的文件读一遍要几秒，不能卡住长连接的事件线程。
         每段发完立刻删掉该段文件——它们只是中转产物，留着白占磁盘。
         原文件始终保留。
         """
         try:
-            parts = split_mp3(path)
+            targets = [paths] if isinstance(paths, (str, Path)) else list(paths)
+            all_parts: list[Path] = []
+            for p in targets:
+                all_parts.extend(split_mp3(Path(p)))
+            parts = all_parts
             if not parts:
                 self.send_text(chat_id, "⚠️ 切分没有产生分段，文件可能小于上限。")
                 return
@@ -537,7 +578,7 @@ class FeishuBot:
             self.send_text(
                 chat_id,
                 f"✅ 切分发送完成：{ok_n}/{total} 段。\n"
-                f"原文件仍在：{path}",
+                f"原文件仍在：{parts[0].parent if parts else ''}",
             )
         except Exception:
             log.exception("切分发送异常")

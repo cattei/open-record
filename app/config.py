@@ -30,6 +30,11 @@ DEFAULTS: dict = {
     "keep_native_rate": True,
     "merge_mp3": True,
     "mp3_bitrate": 192,
+    # 按小时切分合并：把超长录音拆成若干个「每段约 N 分钟」的 mp3。
+    # 0 表示不切分（旧行为，整段合成一个文件）。
+    # 默认 60 分钟的理由见 merge.merge_session 的注释：单文件既便于
+    # 定位某一段、也便于分享与传输（飞书单文件上限 30MB）。
+    "segment_minutes": 60,
     "gain": 12.0,
     "transcribe": False,
     "autostart": True,
@@ -41,7 +46,8 @@ DEFAULTS: dict = {
 
 # 需要在设置界面里露出的键（供 GUI 遍历，避免手写清单与默认值漂移）
 UI_KEYS = ("recordings_dir", "prebuffer_sec", "always_on_mic", "chunk_sec",
-           "max_hours", "mp3_bitrate", "gain", "autostart", "transcribe")
+           "max_hours", "mp3_bitrate", "segment_minutes", "gain", "autostart",
+           "transcribe")
 
 
 def deep_merge(base: dict, over: dict) -> dict:
