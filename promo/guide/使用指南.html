@@ -203,15 +203,12 @@ strong{color:var(--text)}
 <blockquote><p><strong>为什么强调这一点</strong>：程序依赖 <code>runtime\</code> 里的 Python 和 <code>app\</code> 里的代码。 只拷一个 bat 出去，双击后会提示「找不到内置 Python 运行时」。</p></blockquote>
 <h3>3. 双击启动</h3>
 <p>双击 <strong><code>启动录音助手.bat</code></strong>。</p>
-<p>首次启动会做三件事：</p>
+<p>首次启动会做两件事：</p>
 <ol>
 <li>把程序注册为<strong>开机自启</strong>（写入当前用户的注册表，<strong>不需要管理员权限</strong>，不会弹 UAC）</li>
-<li>注册<strong>守护任务</strong>：每 5 分钟检查一次，进程不在了就拉起来</li>
 <li>在右下角托盘区显示图标，然后窗口打开</li>
 </ol>
 <p>之后每次开机，程序会静默驻留托盘，不再弹窗。</p>
-<blockquote><p><strong>为什么需要守护</strong>：开机自启只保证「开机时启动一次」。如果程序中途死掉 （崩溃、被误杀、系统更新），在下次开机前你就完全没有录音能力了——而且 <strong>不会有任何提示</strong>。你可能会以为它在后台待命，实际上它早就不在了。 守护任务由 Windows 计划任务每 5 分钟检查一次，发现不在就拉起来。</p>
-<p>它靠「单实例锁」判活，所以不会起两个实例、不会抢麦克风。 注册在当前用户名下（任务名 <code>ProjectRecord-Guardian</code>），同样不需要管理员权限。</p></blockquote>
 <blockquote><p>bat 的逻辑很简单：优先用 <code>runtime\python\pythonw.exe</code>（不带黑窗）启动 <code>app\launcher.py</code>；找不到 pythonw 就退回 <code>python.exe</code>；两个都没有才报错。</p></blockquote>
 <h3>4. 从源码运行（可选）</h3>
 <p>如果你下的是仓库 ZIP（没有 runtime），或者想自己控制 Python 环境：</p>
@@ -246,8 +243,7 @@ python packaging\package.py         :: 组装 dist\open-record\ 并打 zip</code
 <p>点窗口右上角的 <strong>×</strong>，窗口只是<strong>收进托盘</strong>，程序继续在后台运行。</p>
 <p>这是刻意设计的：录音工具应该随手可用，而不是每次都重新启动。</p>
 <p><strong>真正退出</strong>只有一个入口：右键托盘图标 → <strong>退出</strong>。</p>
-<blockquote><p><strong>退出后守护不会再拉它起来。</strong> 程序会在程序目录写一个 <code>.user_quit</code> 标记， 守护任务看到就跳过——你的退出意图优先于自动保活。 下次开机、或你手动双击 <code>启动录音助手.bat</code> 时，标记自动清除，守护恢复看护。</p>
-<p>反过来说：如果是<strong>崩溃</strong>（不是主动退出），守护会在 5 分钟内把它拉回来， 并在日志里留下记录。这正是它存在的意义。</p></blockquote>
+<blockquote><p>退出就是真退出，不会有人把它偷偷拉回来。</p></blockquote>
 <hr>
 <h2>四、录一段</h2>
 <h3>开始</h3>

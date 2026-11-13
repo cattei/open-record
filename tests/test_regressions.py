@@ -511,47 +511,36 @@ def test_feishu_silences_noise_events():
     check("已注册全部噪音事件处理器", not missing, f"缺少={missing}")
 
 
-def test_guardian_uses_lock_port():
-    """守护必须用单实例锁端口判活，不能靠数进程。
+def test_background_start_never_pops_window():
+    """后台启动且已有实例时，必须静默退出，绝不能弹窗。
 
-    为什么这条重要：机器上可能有别的 pythonw 在跑，数进程会误判成
-    「已经在跑」而放弃拉起——正是那次事故的失败模式（看着在跑其实没在）。
-    锁端口只有真正在服务的实例才占用，是权威信号。
+    真实事故：用户被「动不动就弹出界面」骚扰。根因是单实例分支里
+    无条件调 notify_existing("show")——任何重复触发（开机自启重跑、
+    计划任务、外部脚本）都会把已收进托盘的窗口硬拽出来。
+    注释里写了「只有带 --background 且已有实例时才静默退出」，
+    但代码根本没实现这个条件。
 
-    同时验证拉起时用的是 autostart 的 pythonw + launcher，
-    而不是写死路径（换机器/换目录就失效）。
+    断言：start_hidden 分支在拿不到锁时直接 return，不调 notify_existing。
     """
-    print("\\n[P2] 守护判活方式")
-    src = (APP / "guardian.py").read_text(encoding="utf-8")
+    print("\\n[P2] 后台启动不得弹窗")
+    src = (APP / "gui.py").read_text(encoding="utf-8")
 
-    check("用 singleton.LOCK_PORT 判活", "singleton.LOCK_PORT" in src,
-          "未使用锁端口")
-    check("不靠数进程判活", "tasklist" not in src.lower(),
-          "仍用 tasklist 数进程（会误判）")
-    check("拉起走 autostart.pythonw", "autostart.pythonw()" in src,
-          "路径可能写死")
-    check("拉起带 --background", "autostart.FLAG" in src,
-          "未使用 autostart.FLAG")
+    i = src.find("if not have_lock:")
+    j = src.find("app = QApplication(sys.argv)")
+    blk = src[i:j]
+    check("单实例分支存在", i > 0, "未找到 have_lock 分支")
+    check("后台启动先判 start_hidden", "if start_hidden:" in blk,
+          "未按 start_hidden 分流，会无条件弹窗")
 
-    # 语法可导入（不执行安装动作）
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("guardian_mod", APP / "guardian.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    check("可导入且暴露 is_running", hasattr(mod, "is_running"), "缺少 is_running")
-    check("可导入且暴露 check_and_heal", hasattr(mod, "check_and_heal"), "缺少 check_and_heal")
-
-    # 用户主动退出后不能被强行拉起，否则「右键退出」这个功能就是假的
-    check("退出标记机制存在", "def mark_user_quit" in src and "def user_quit" in src,
-          "缺少用户退出标记")
-    i = src.find("def check_and_heal")
-    j = src.find("def _ps")
-    heal = src[i:j]
-    check("守护尊重用户退出", "user_quit()" in heal,
-          "check_and_heal 未检查退出标记")
-    gui_src = (APP / "gui.py").read_text(encoding="utf-8")
-    check("退出时写标记", "mark_user_quit()" in gui_src, "request_quit 未写标记")
-    check("启动时清标记", "clear_user_quit()" in gui_src, "启动未清标记")
+    # start_hidden 分支必须在 notify_existing 之前 return
+    k = blk.find("if start_hidden:")
+    if k >= 0:
+        seg = blk[k:k + 260]
+        before_notify = seg.find("notify_existing")
+        has_return = "return 0" in seg
+        check("后台分支在弹窗前返回",
+              has_return and (before_notify < 0 or seg.find("return 0") < before_notify),
+              "后台分支仍会调 notify_existing")
 
 
 def test_merge_segments_by_duration():
@@ -754,7 +743,7 @@ def main():
     test_finish_session_lock()
     test_writer_reuse()
     test_feishu_bot_ctor_order()
-    test_guardian_uses_lock_port()
+    test_background_start_never_pops_window()
     test_merge_segments_by_duration()
     test_mp3_split_frame_aligned()
     test_feishu_silences_noise_events()
